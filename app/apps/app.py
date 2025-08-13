@@ -1,3 +1,4 @@
+# app.py  — Streamlit: Googleフォーム→スプレッドシート→マトリクス可視化（完全版）
 import os, re, json
 import pandas as pd
 import streamlit as st
@@ -8,8 +9,8 @@ import gspread
 from google.oauth2.service_account import Credentials
 from gspread_dataframe import get_as_dataframe
 
-# ========= 日本語フォント（メイリオ優先、なければデフォルト） =========
-MEIRYO_PATH = r"/usr/share/fonts/truetype/msttcorefonts/Meiryo.ttf"  # Linux環境用の例
+# ========================= 日本語フォント =========================
+MEIRYO_PATH = r"/usr/share/fonts/truetype/msttcorefonts/Meiryo.ttf"  # Linuxの例
 try:
     if os.path.exists(MEIRYO_PATH):
         font_manager.fontManager.addfont(MEIRYO_PATH)
@@ -20,7 +21,7 @@ except Exception:
     rcParams["font.family"] = "DejaVu Sans"
 rcParams["axes.unicode_minus"] = False
 
-# ========= 評価項目（正規名） =========
+# ========================= 評価定義 =========================
 DIVERSITY_COLS = [
     "多様性1_メニューの独自性","多様性2_内装の個性","多様性3_店主・スタッフのキャラ","多様性4_サービス独自性",
     "多様性5_地域性の反映","多様性6_イベント/季節","多様性7_SNSのユニークさ","多様性8_客層の多様性",
@@ -34,24 +35,42 @@ BRAND_COLS = [
 BASE_COLS = ["日付","店名","味フィルター（必要条件）"]
 REQUIRED_COLS = BASE_COLS + DIVERSITY_COLS + BRAND_COLS
 
-# 見出しのゆらぎを吸収（部分一致）
+# 見出しゆらぎ吸収
 NORMALIZE_RULES = {
-    "訪問日": "日付", "お店名": "店名", "Step 0": "味フィルター（必要条件）",
-    "メニューの独自性": "多様性1_メニューの独自性", "内装の個性": "多様性2_内装の個性",
-    "店主": "多様性3_店主・スタッフのキャラ", "サービス独自性": "多様性4_サービス独自性",
-    "地域性": "多様性5_地域性の反映", "イベント": "多様性6_イベント/季節", "季節": "多様性6_イベント/季節",
-    "SNS": "多様性7_SNSのユニークさ", "客層": "多様性8_客層の多様性",
-    "提供方法": "多様性9_提供方法の特異性", "物語性": "多様性10_店の物語性",
-    "味の信頼感": "防衛1_味の信頼感（初訪）", "衛生": "防衛2_衛生/清潔感", "清潔": "防衛2_衛生/清潔感",
-    "接客": "防衛3_接客態度", "価格の明確さ": "防衛4_価格の明確さ", "提供スピード": "防衛5_提供スピード",
-    "支払い": "防衛6_支払いの安全性", "入店しやすさ": "防衛7_入店しやすさ",
-    "初見客": "防衛8_初見客への対応", "口コミ": "防衛9_常連/口コミ", "リスク対応力": "防衛10_リスク対応力",
+    # ベース
+    "タイムスタンプ": "タイムスタンプ",
+    "訪問日": "日付", "お店名": "店名", "店名": "店名",
+    "Step 0": "味フィルター（必要条件）", "味フィルター": "味フィルター（必要条件）",
+    # 多様性
+    "メニューの独自性": "多様性1_メニューの独自性",
+    "内装の個性": "多様性2_内装の個性",
+    "店主": "多様性3_店主・スタッフのキャラ", "スタッフ": "多様性3_店主・スタッフのキャラ",
+    "サービス独自性": "多様性4_サービス独自性",
+    "地域性": "多様性5_地域性の反映",
+    "イベント": "多様性6_イベント/季節", "季節": "多様性6_イベント/季節",
+    "SNS": "多様性7_SNSのユニークさ",
+    "客層": "多様性8_客層の多様性",
+    "提供方法": "多様性9_提供方法の特異性",
+    "物語性": "多様性10_店の物語性",
+    # 防衛
+    "味の信頼感": "防衛1_味の信頼感（初訪）",
+    "衛生": "防衛2_衛生/清潔感", "清潔": "防衛2_衛生/清潔感",
+    "接客": "防衛3_接客態度",
+    "価格の明確さ": "防衛4_価格の明確さ",
+    "提供スピード": "防衛5_提供スピード",
+    "支払い": "防衛6_支払いの安全性",
+    "入店しやすさ": "防衛7_入店しやすさ",
+    "初見客": "防衛8_初見客への対応",
+    "口コミ": "防衛9_常連/口コミ",
+    "リスク対応力": "防衛10_リスク対応力",
 }
 
 MIDLINE = 30
 MIN_SCORE, MAX_SCORE = 1, 5
 
+# ========================= ユーティリティ =========================
 def extract_sheet_id(text: str) -> str:
+    """URLでもIDでもOK。/d/…/edit から抽出。"""
     m = re.search(r"/d/([a-zA-Z0-9-_]+)/", text.strip())
     return m.group(1) if m else text.strip()
 
@@ -66,9 +85,52 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = new_cols
     return df
 
+def build_creds_from_secrets_or_text() -> dict | None:
+    """
+    Secretsを2方式対応:
+      A) st.secrets['gcp']['service_account_json'] にJSON文字列
+      B) st.secrets['gcp'] に個別キー（project_id 等）
+    無ければ貼り付けUIを出す。
+    """
+    svc = st.secrets.get("gcp", {})
+    # A: JSON丸ごと
+    if "service_account_json" in svc:
+        try:
+            return json.loads(svc["service_account_json"])
+        except Exception as e:
+            st.error(f"Secretsの service_account_json が不正です: {e}")
+            return None
+    # B: 個別キー
+    required = {"type","project_id","private_key_id","private_key","client_email","client_id"}
+    if required.issubset(set(svc.keys())):
+        return {
+            "type": "service_account",
+            "project_id": svc["project_id"],
+            "private_key_id": svc["private_key_id"],
+            "private_key": svc["private_key"],
+            "client_email": svc["client_email"],
+            "client_id": svc["client_id"],
+            "auth_uri": svc.get("auth_uri","https://accounts.google.com/o/oauth2/auth"),
+            "token_uri": svc.get("token_uri","https://oauth2.googleapis.com/token"),
+            "auth_provider_x509_cert_url": svc.get("auth_provider_x509_cert_url","https://www.googleapis.com/oauth2/v1/certs"),
+            "client_x509_cert_url": svc.get("client_x509_cert_url",""),
+            "universe_domain": svc.get("universe_domain","googleapis.com"),
+        }
+    # C: 未設定 → 貼り付け救済
+    with st.expander("🔐 サービスアカウントJSONをここに貼り付け（Secretsが未設定のとき用）", expanded=True):
+        pasted = st.text_area("Paste JSON", height=180, label_visibility="collapsed")
+        if pasted.strip():
+            try:
+                return json.loads(pasted)
+            except Exception as e:
+                st.error(f"JSON解析に失敗: {e}")
+    return None
+
 @st.cache_data(show_spinner=False)
 def load_sheet(creds_dict: dict, sheet_id: str, worksheet: str) -> pd.DataFrame:
-    creds = Credentials.from_service_account_info(creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+    creds = Credentials.from_service_account_info(
+        creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    )
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(sheet_id)
     ws = sh.worksheet(worksheet)
@@ -111,49 +173,63 @@ def draw_plot(df: pd.DataFrame):
     ax.set_title("飲食店スコア・マトリクス（味OKのみプロット）")
     st.pyplot(fig, clear_figure=True)
 
-# ===================== UI =====================
+# ========================= UI =========================
 st.set_page_config(page_title="飲食店スコア・マトリクス", layout="wide")
 st.title("飲食店スコア・マトリクス（Googleフォーム → スプレッドシート）")
 
-# Secrets（Streamlit Cloud の「Settings > Secrets」へ設定）
-# 例:
-# [gcp]
-# service_account_json = {...}  # サービスアカウントのJSON一式
-# sheet_id = "xxxxxxxxxxxxxxxxxxxx"
-# worksheet = "Form Responses"
-svc_json = st.secrets["gcp"]["service_account_json"]
-default_sheet_id = st.secrets["gcp"].get("sheet_id", "")
-default_ws = st.secrets["gcp"].get("worksheet", "Form Responses")
+# Secrets 既定値（あれば利用）
+default_sheet_id = st.secrets.get("gcp", {}).get("sheet_id", "")
+default_ws = st.secrets.get("gcp", {}).get("worksheet", "Form Responses")
 
-col1, col2 = st.columns(2)
-with col1:
-    sheet_id_input = st.text_input("Spreadsheet ID / URL", value=default_sheet_id, placeholder="IDまたはURLを入力")
-with col2:
+with st.sidebar:
+    st.header("設定")
+    sheet_id_input = st.text_input("Spreadsheet ID / URL", value=default_sheet_id, placeholder="ID または URL を入力")
     ws_name = st.text_input("Worksheet名（タブ名）", value=default_ws, placeholder="例：Form Responses / フォームの回答 1")
+    dedup_keys = st.text_input("重複除去キー（カンマ区切り）", value="店名,日付")
+    ts_col = st.text_input("タイムスタンプ列（任意）", value="タイムスタンプ")
+    go = st.button("読み込み＆プロット", type="primary")
 
-if st.button("読み込み＆プロット", type="primary"):
+if go:
+    creds = build_creds_from_secrets_or_text()
+    if not creds:
+        st.stop()
+
     try:
-        sid = extract_sheet_id(sheet_id_input)
-        df = load_sheet(json.loads(svc_json), sid, ws_name)
+        sid = extract_sheet_id(sheet_id_input or default_sheet_id)
+        if not sid:
+            st.error("Spreadsheet ID / URL を入力してください。"); st.stop()
+
+        df = load_sheet(creds, sid, ws_name or default_ws)
+
         # 必要列チェック
         missing = [c for c in REQUIRED_COLS if c not in df.columns]
         if missing:
             st.error(f"必要列が不足しています: {missing}")
-        else:
-            df = coerce_scores(df)
-            before = len(df)
-            df = deduplicate(df, keys=("店名","日付"), ts_col="タイムスタンプ")
-            after = len(df)
-            st.caption(f"重複除去: {before - after}件（キー: 店名×日付、タイムスタンプ最新を採用）")
-            df = compute_totals(df)
+            st.dataframe(df.head())
+            st.stop()
 
-            draw_plot(df)
-            st.dataframe(df[BASE_COLS + ["多様性合計","防衛合計"]].sort_values(["日付","店名"]))
+        df = coerce_scores(df)
 
-            csv = df.to_csv(index=False).encode("utf-8-sig")
-            st.download_button("CSVをダウンロード", data=csv, file_name="scores_cleaned.csv", mime="text/csv")
+        keys = tuple([k.strip() for k in (dedup_keys or "店名,日付").split(",") if k.strip()])
+        before = len(df)
+        df = deduplicate(df, keys=keys if keys else ("店名","日付"), ts_col=ts_col or "タイムスタンプ")
+        after = len(df)
+
+        st.caption(f"重複除去: {before - after}件（キー: {keys if keys else ('店名','日付')} / タイムスタンプ最新を採用）")
+
+        df = compute_totals(df)
+        draw_plot(df)
+
+        st.dataframe(
+            df[BASE_COLS + ["多様性合計","防衛合計"]].sort_values(["日付","店名"]),
+            use_container_width=True
+        )
+        # ダウンロード
+        csv = df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("CSVをダウンロード", data=csv, file_name="scores_cleaned.csv", mime="text/csv")
+
     except Exception as e:
         st.exception(e)
 
 st.markdown("---")
-st.write("💡 メモ：このアプリは *Yes* の味フィルターのみをプロットし、境界は 30 点（10項目×3）です。見出しが微妙に違っても自動で寄せます。")
+st.write("💡 *Yes* の味フィルターのみをプロット。境界は 30 点（10項目×3）。見出しのゆらぎは自動で正規化します。")
