@@ -9,18 +9,12 @@ import gspread
 from google.oauth2.service_account import Credentials
 from gspread_dataframe import get_as_dataframe
 from gspread.exceptions import SpreadsheetNotFound, WorksheetNotFound
+from pathlib import Path
 
 # ========================= 日本語フォント =========================
-MEIRYO_PATH = r"/usr/share/fonts/truetype/msttcorefonts/Meiryo.ttf"  # Linuxの例
-try:
-    if os.path.exists(MEIRYO_PATH):
-        font_manager.fontManager.addfont(MEIRYO_PATH)
-        rcParams["font.family"] = font_manager.FontProperties(fname=MEIRYO_PATH).get_name()
-    else:
-        rcParams["font.family"] = "DejaVu Sans"
-except Exception:
-    rcParams["font.family"] = "DejaVu Sans"
-rcParams["axes.unicode_minus"] = False
+# 1) まずはプロジェクト同梱の日本語フォントを最優先で使う
+FONT_DIR = Path(__file__).parent / "fonts"
+JP_FONT = FONT_DIR / "NotoSansJP-Regular.ttf"  # 同梱したファイル名に合わせて
 
 # ========================= 評価定義 =========================
 DIVERSITY_COLS = [
