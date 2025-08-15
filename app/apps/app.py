@@ -1,9 +1,10 @@
-# app.py — Streamlit: Googleフォーム→スプレッドシート→マトリクス可視化（完全版）
+# app.py — Streamlit: Googleフォーム→スプレッドシート→マトリクス可視化（完全版・店名ラベル付き）
 import os, re, json, unicodedata
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 from matplotlib import font_manager, rcParams
+from matplotlib.patches import Rectangle
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -11,30 +12,26 @@ from gspread_dataframe import get_as_dataframe
 from gspread.exceptions import SpreadsheetNotFound, WorksheetNotFound
 from pathlib import Path
 
-# ========================= 日本語フォントの有効化（最小パッチ） =========================
+# ========================= 日本語フォントの有効化（同梱フォント優先） =========================
 FONT_DIR = Path(__file__).parent / "fonts"
 JP_FONT = FONT_DIR / "NotoSansJP-Regular.ttf"
 
 try:
     if JP_FONT.exists():
         font_manager.fontManager.addfont(str(JP_FONT))
-        # 追加フォントを検索対象に反映
         try:
             font_manager._rebuild()
         except Exception:
             pass
-        # 追加したTTFの内部フォント名を取得して、sans-serif の先頭に据える
         jp_name = font_manager.FontProperties(fname=str(JP_FONT)).get_name()
         rcParams["font.family"] = "sans-serif"
         rcParams["font.sans-serif"] = [jp_name, "DejaVu Sans", "Arial", "Liberation Sans"]
     else:
-        # 同梱フォントが無いときの最後の砦
         rcParams["font.family"] = "DejaVu Sans"
     rcParams["axes.unicode_minus"] = False
 except Exception:
     rcParams["font.family"] = "DejaVu Sans"
     rcParams["axes.unicode_minus"] = False
-
 
 # ========================= 評価定義 =========================
 DIVERSITY_COLS = [
@@ -92,18 +89,15 @@ MIN_SCORE, MAX_SCORE = 1, 5
 
 # ========================= 正規化ユーティリティ =========================
 def _norm(s: str) -> str:
-    """NFKC正規化→全空白除去→小文字化（マッチ用）"""
     s = unicodedata.normalize("NFKC", str(s))
     return s.replace(" ", "").replace("　", "").lower()
 
 def extract_sheet_id(text: str) -> str:
-    """URLでもIDでもOK。/d/…/ から抽出。/edit が無くても対応。"""
     t = (text or "").strip()
     m = re.search(r"/d/([a-zA-Z0-9-_]+)/?", t)
     return m.group(1) if m else t
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """列名をルールベースで正規化（包含判定は正規化後で頑丈に）"""
     new_cols = []
     for c in df.columns:
         cc_norm = _norm(c)
@@ -118,21 +112,13 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 # ========================= 認証情報 =========================
 def build_creds_from_secrets_or_text() -> dict | None:
-    """
-    Secretsを2方式対応:
-      A) st.secrets['gcp']['service_account_json'] にJSON文字列
-      B) st.secrets['gcp'] に個別キー（project_id 等）
-    無ければ貼り付けUIを出す。
-    """
     svc = st.secrets.get("gcp", {})
-    # A: JSON丸ごと
     if "service_account_json" in svc:
         try:
             return json.loads(svc["service_account_json"])
         except Exception as e:
             st.error(f"Secretsの service_account_json が不正です: {e}")
             return None
-    # B: 個別キー
     required = {"type","project_id","private_key_id","private_key","client_email","client_id"}
     if required.issubset(set(svc.keys())):
         return {
@@ -148,7 +134,6 @@ def build_creds_from_secrets_or_text() -> dict | None:
             "client_x509_cert_url": svc.get("client_x509_cert_url",""),
             "universe_domain": svc.get("universe_domain","googleapis.com"),
         }
-    # C: 未設定 → 貼り付け救済
     with st.expander("🔐 サービスアカウントJSONをここに貼り付け（Secretsが未設定のとき用）", expanded=True):
         pasted = st.text_area("Paste JSON", height=180, label_visibility="collapsed")
         if pasted.strip():
@@ -166,11 +151,9 @@ def load_sheet(creds_dict: dict, sheet_id: str, worksheet: str) -> pd.DataFrame:
     )
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(sheet_id)
-    # worksheet名が曖昧な可能性に少し寄り添う
     try:
         ws = sh.worksheet(worksheet)
     except WorksheetNotFound:
-        # 類似候補を探す
         titles = [w.title for w in sh.worksheets()]
         norm_ws = _norm(worksheet)
         cand = [t for t in titles if _norm(t) == norm_ws or _norm(worksheet) in _norm(t)]
@@ -202,22 +185,55 @@ def deduplicate(df: pd.DataFrame, keys=("店名","日付"), ts_col="タイムス
 def compute_totals(df: pd.DataFrame) -> pd.DataFrame:
     df["多様性合計"] = df[DIVERSITY_COLS].sum(axis=1)
     df["防衛合計"] = df[BRAND_COLS].sum(axis=1)
-    mask = df["味フィルター（必要条件）"].astype(str).str.strip().str.lower().isin(["yes","y","true","1","ok","○"])
-    df["_plot_x"] = df["多様性合計"].where(mask)
-    df["_plot_y"] = df["防衛合計"].where(mask)
     return df
 
 # ========================= 描画 =========================
-def draw_plot(df: pd.DataFrame):
-    fig, ax = plt.subplots(figsize=(8.8, 5.6), dpi=120)
-    plot_df = df.dropna(subset=["_plot_x","_plot_y"])
-    ax.scatter(plot_df["_plot_x"], plot_df["_plot_y"], s=42)
-    ax.axvline(MIDLINE, lw=1); ax.axhline(MIDLINE, lw=1)
-    ax.set_xlim(0,50); ax.set_ylim(0,50)
+def draw_plot(df: pd.DataFrame, show_all: bool, show_labels: bool, max_labels: int):
+    fig, ax = plt.subplots(figsize=(9, 6), dpi=120)
+
+    # 味OKの定義（増やしたければここに追加）
+    ok_vals = {"yes","y","true","1","ok","○","はい","可"}
+    mask = df["味フィルター（必要条件）"].astype(str).str.strip().str.lower().isin(ok_vals)
+
+    plot_df = df.copy() if show_all else df[mask].copy()
+
+    # 背景（象限を薄く塗る）
+    ax.add_patch(Rectangle((0, 0), 50, 50, facecolor=(0,0,0,0.02), edgecolor="none"))
+    ax.add_patch(Rectangle((MIDLINE, 0), 50-MIDLINE, 50, facecolor=(0,0,0,0.04), edgecolor="none"))
+    ax.add_patch(Rectangle((0, MIDLINE), 50, 50-MIDLINE, facecolor=(0,0,0,0.04), edgecolor="none"))
+
+    # 散布図
+    ax.scatter(plot_df["多様性合計"], plot_df["防衛合計"], s=64, alpha=0.9, linewidths=0.6, edgecolors="white")
+
+    # 交差線
+    ax.axvline(MIDLINE, lw=1)
+    ax.axhline(MIDLINE, lw=1)
+
+    # 軸とタイトル
+    ax.set_xlim(0, 50); ax.set_ylim(0, 50)
     ax.set_xlabel("多様性合計（1〜5×10＝10〜50）")
     ax.set_ylabel("ブランド防衛合計（1〜5×10＝10〜50）")
-    ax.set_title("飲食店スコア・マトリクス（味OKのみプロット）")
+    ax.set_title("飲食店スコア・マトリクス（味OKのみ）" if not show_all else "飲食店スコア・マトリクス（全件）")
+
+    # ラベル（店名）
+    if show_labels and not plot_df.empty:
+        # 点数が高い順に最大 max_labels 件だけ注釈して、重なりを少し回避する
+        label_df = plot_df.sort_values(["多様性合計","防衛合計"], ascending=False).head(max_labels)
+        for _, r in label_df.iterrows():
+            ax.annotate(
+                str(r["店名"]),
+                (r["多様性合計"], r["防衛合計"]),
+                xytext=(4, 4), textcoords="offset points", fontsize=9
+            )
+        if len(plot_df) > max_labels:
+            st.caption(f"※ ラベルは {max_labels} 件まで表示（全{len(plot_df)}件中）。サイドバーで変更できます。")
+
+    st.caption(f"プロット数: {len(plot_df)} / 全体: {len(df)}（{'全件' if show_all else '味OKのみ'}）")
     st.pyplot(fig, clear_figure=True)
+
+    # 下に「店名と座標」の表を出す（場所が分かるように）
+    shown = plot_df.loc[:, ["店名","多様性合計","防衛合計"]].sort_values(["防衛合計","多様性合計"], ascending=False)
+    st.dataframe(shown, use_container_width=True)
 
 # ========================= UI =========================
 st.set_page_config(page_title="飲食店スコア・マトリクス", layout="wide")
@@ -233,6 +249,11 @@ with st.sidebar:
     ws_name = st.text_input("Worksheet名（タブ名）", value=default_ws, placeholder="例：Form Responses / フォームの回答 1")
     dedup_keys = st.text_input("重複除去キー（カンマ区切り）", value="店名,日付")
     ts_col = st.text_input("タイムスタンプ列（任意）", value="タイムスタンプ")
+
+    # 表示オプション
+    show_all = st.checkbox("味フィルター無視（全てプロット）", value=False)
+    show_labels = st.checkbox("店名ラベルを表示", value=True)
+    max_labels = st.slider("ラベル最大件数", min_value=0, max_value=200, value=50, step=5)
 
     # 共有漏れ・ID取り違えの即時確認用
     creds_preview = build_creds_from_secrets_or_text()
@@ -273,14 +294,12 @@ if go:
         st.caption(f"重複除去: {before - after}件（キー: {keys if keys else ('店名','日付')} / タイムスタンプ最新を採用）")
 
         df = compute_totals(df)
-        draw_plot(df)
+        draw_plot(df, show_all=show_all, show_labels=show_labels, max_labels=max_labels)
 
-        st.dataframe(
-            df[BASE_COLS + ["多様性合計","防衛合計"]].sort_values(["日付","店名"]),
-            use_container_width=True
-        )
-        # ダウンロード
-        csv = df.to_csv(index=False).encode("utf-8-sig")
+        # ダウンロード（整形済みデータを落とせるように）
+        out = df.copy()
+        out["味OK"] = out["味フィルター（必要条件）"].astype(str)
+        csv = out.to_csv(index=False).encode("utf-8-sig")
         st.download_button("CSVをダウンロード", data=csv, file_name="scores_cleaned.csv", mime="text/csv")
 
     except SpreadsheetNotFound as e:
@@ -290,7 +309,6 @@ if go:
     except WorksheetNotFound as e:
         st.error(f"指定のワークシート（タブ）が見つかりません: {ws_name}")
         try:
-            # 候補を提示
             creds2 = Credentials.from_service_account_info(
                 creds, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
             )
@@ -305,4 +323,4 @@ if go:
         st.exception(e)
 
 st.markdown("---")
-st.write("💡 *Yes* 系の味フィルターのみをプロット。境界は 30 点（10項目×3）。見出しのゆらぎは自動正規化＋エイリアスで吸収します。")
+st.write("💡 デフォルトは *Yes* 系の味フィルターのみをプロット。左のチェックで全件表示、ラベル件数も調整できます。境界は 30 点（10項目×3）。")
