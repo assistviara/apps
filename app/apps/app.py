@@ -1,5 +1,5 @@
-# app.py  — Streamlit: Googleフォーム→スプレッドシート→マトリクス可視化（完全版）
-import os, re, json
+# app.py — Streamlit: Googleフォーム→スプレッドシート→マトリクス可視化（完全版）
+import os, re, json, unicodedata
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
@@ -8,6 +8,7 @@ from matplotlib import font_manager, rcParams
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread_dataframe import get_as_dataframe
+from gspread.exceptions import SpreadsheetNotFound, WorksheetNotFound
 
 # ========================= 日本語フォント =========================
 MEIRYO_PATH = r"/usr/share/fonts/truetype/msttcorefonts/Meiryo.ttf"  # Linuxの例
@@ -35,20 +36,23 @@ BRAND_COLS = [
 BASE_COLS = ["日付","店名","味フィルター（必要条件）"]
 REQUIRED_COLS = BASE_COLS + DIVERSITY_COLS + BRAND_COLS
 
-# 見出しゆらぎ吸収
+# 見出しゆらぎ吸収（エイリアス集）
 NORMALIZE_RULES = {
     # ベース
     "タイムスタンプ": "タイムスタンプ",
     "訪問日": "日付", "お店名": "店名", "店名": "店名",
-    "Step 0": "味フィルター（必要条件）", "味フィルター": "味フィルター（必要条件）",
+    "step0": "味フィルター（必要条件）", "step 0": "味フィルター（必要条件）",
+    "味フィルター": "味フィルター（必要条件）",
     # 多様性
     "メニューの独自性": "多様性1_メニューの独自性",
     "内装の個性": "多様性2_内装の個性",
     "店主": "多様性3_店主・スタッフのキャラ", "スタッフ": "多様性3_店主・スタッフのキャラ",
     "サービス独自性": "多様性4_サービス独自性",
+    "サービスの独自性": "多様性4_サービス独自性",
+    "独自サービス": "多様性4_サービス独自性",
     "地域性": "多様性5_地域性の反映",
     "イベント": "多様性6_イベント/季節", "季節": "多様性6_イベント/季節",
-    "SNS": "多様性7_SNSのユニークさ",
+    "sns": "多様性7_SNSのユニークさ", "ＳＮＳ": "多様性7_SNSのユニークさ",
     "客層": "多様性8_客層の多様性",
     "提供方法": "多様性9_提供方法の特異性",
     "物語性": "多様性10_店の物語性",
@@ -60,6 +64,10 @@ NORMALIZE_RULES = {
     "提供スピード": "防衛5_提供スピード",
     "支払い": "防衛6_支払いの安全性",
     "入店しやすさ": "防衛7_入店しやすさ",
+    "入店のしやすさ": "防衛7_入店しやすさ",
+    "入りやすさ": "防衛7_入店しやすさ",
+    "入り易さ": "防衛7_入店しやすさ",
+    "入店し易さ": "防衛7_入店しやすさ",
     "初見客": "防衛8_初見客への対応",
     "口コミ": "防衛9_常連/口コミ",
     "リスク対応力": "防衛10_リスク対応力",
@@ -68,23 +76,33 @@ NORMALIZE_RULES = {
 MIDLINE = 30
 MIN_SCORE, MAX_SCORE = 1, 5
 
-# ========================= ユーティリティ =========================
+# ========================= 正規化ユーティリティ =========================
+def _norm(s: str) -> str:
+    """NFKC正規化→全空白除去→小文字化（マッチ用）"""
+    s = unicodedata.normalize("NFKC", str(s))
+    return s.replace(" ", "").replace("　", "").lower()
+
 def extract_sheet_id(text: str) -> str:
-    """URLでもIDでもOK。/d/…/edit から抽出。"""
-    m = re.search(r"/d/([a-zA-Z0-9-_]+)/", text.strip())
-    return m.group(1) if m else text.strip()
+    """URLでもIDでもOK。/d/…/ から抽出。/edit が無くても対応。"""
+    t = (text or "").strip()
+    m = re.search(r"/d/([a-zA-Z0-9-_]+)/?", t)
+    return m.group(1) if m else t
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """列名をルールベースで正規化（包含判定は正規化後で頑丈に）"""
     new_cols = []
     for c in df.columns:
-        cc, mapped = str(c), None
+        cc_norm = _norm(c)
+        mapped = None
         for key, dest in NORMALIZE_RULES.items():
-            if key in cc:
-                mapped = dest; break
-        new_cols.append(mapped or cc)
+            if _norm(key) in cc_norm:
+                mapped = dest
+                break
+        new_cols.append(mapped or c)
     df.columns = new_cols
     return df
 
+# ========================= 認証情報 =========================
 def build_creds_from_secrets_or_text() -> dict | None:
     """
     Secretsを2方式対応:
@@ -126,6 +144,7 @@ def build_creds_from_secrets_or_text() -> dict | None:
                 st.error(f"JSON解析に失敗: {e}")
     return None
 
+# ========================= データ取得 =========================
 @st.cache_data(show_spinner=False)
 def load_sheet(creds_dict: dict, sheet_id: str, worksheet: str) -> pd.DataFrame:
     creds = Credentials.from_service_account_info(
@@ -133,11 +152,23 @@ def load_sheet(creds_dict: dict, sheet_id: str, worksheet: str) -> pd.DataFrame:
     )
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(sheet_id)
-    ws = sh.worksheet(worksheet)
+    # worksheet名が曖昧な可能性に少し寄り添う
+    try:
+        ws = sh.worksheet(worksheet)
+    except WorksheetNotFound:
+        # 類似候補を探す
+        titles = [w.title for w in sh.worksheets()]
+        norm_ws = _norm(worksheet)
+        cand = [t for t in titles if _norm(t) == norm_ws or _norm(worksheet) in _norm(t)]
+        if cand:
+            ws = sh.worksheet(cand[0])
+        else:
+            raise
     df = get_as_dataframe(ws, evaluate_formulas=True, header=0)
     df = df.dropna(how="all")
     return normalize_columns(df)
 
+# ========================= 前処理 =========================
 def coerce_scores(df: pd.DataFrame) -> pd.DataFrame:
     for c in DIVERSITY_COLS + BRAND_COLS:
         s = pd.to_numeric(df[c], errors="coerce").clip(MIN_SCORE, MAX_SCORE).fillna(MIN_SCORE).astype(int)
@@ -157,16 +188,17 @@ def deduplicate(df: pd.DataFrame, keys=("店名","日付"), ts_col="タイムス
 def compute_totals(df: pd.DataFrame) -> pd.DataFrame:
     df["多様性合計"] = df[DIVERSITY_COLS].sum(axis=1)
     df["防衛合計"] = df[BRAND_COLS].sum(axis=1)
-    mask = df["味フィルター（必要条件）"].astype(str).str.strip().str.lower().eq("yes")
+    mask = df["味フィルター（必要条件）"].astype(str).str.strip().str.lower().isin(["yes","y","true","1","ok","○"])
     df["_plot_x"] = df["多様性合計"].where(mask)
     df["_plot_y"] = df["防衛合計"].where(mask)
     return df
 
+# ========================= 描画 =========================
 def draw_plot(df: pd.DataFrame):
     fig, ax = plt.subplots(figsize=(8.8, 5.6), dpi=120)
     plot_df = df.dropna(subset=["_plot_x","_plot_y"])
     ax.scatter(plot_df["_plot_x"], plot_df["_plot_y"], s=42)
-    ax.axvline(MIDLINE, color="grey", lw=1); ax.axhline(MIDLINE, color="grey", lw=1)
+    ax.axvline(MIDLINE, lw=1); ax.axhline(MIDLINE, lw=1)
     ax.set_xlim(0,50); ax.set_ylim(0,50)
     ax.set_xlabel("多様性合計（1〜5×10＝10〜50）")
     ax.set_ylabel("ブランド防衛合計（1〜5×10＝10〜50）")
@@ -187,10 +219,19 @@ with st.sidebar:
     ws_name = st.text_input("Worksheet名（タブ名）", value=default_ws, placeholder="例：Form Responses / フォームの回答 1")
     dedup_keys = st.text_input("重複除去キー（カンマ区切り）", value="店名,日付")
     ts_col = st.text_input("タイムスタンプ列（任意）", value="タイムスタンプ")
+
+    # 共有漏れ・ID取り違えの即時確認用
+    creds_preview = build_creds_from_secrets_or_text()
+    sid_preview = extract_sheet_id(sheet_id_input or default_sheet_id)
+    if creds_preview:
+        st.caption(f"🔑 SA: {creds_preview.get('client_email','(unknown)')}")
+    if sid_preview:
+        st.caption(f"📄 Sheet ID: {sid_preview}")
+
     go = st.button("読み込み＆プロット", type="primary")
 
 if go:
-    creds = build_creds_from_secrets_or_text()
+    creds = creds_preview or build_creds_from_secrets_or_text()
     if not creds:
         st.stop()
 
@@ -201,10 +242,11 @@ if go:
 
         df = load_sheet(creds, sid, ws_name or default_ws)
 
-        # 必要列チェック
+        # 必要列チェック（正規化後）
         missing = [c for c in REQUIRED_COLS if c not in df.columns]
         if missing:
             st.error(f"必要列が不足しています: {missing}")
+            st.caption("💡 列名の表記ゆらぎが原因の場合は、1行目の見出しを正確に合わせるか、NORMALIZE_RULES にエイリアスを追加してください。")
             st.dataframe(df.head())
             st.stop()
 
@@ -214,7 +256,6 @@ if go:
         before = len(df)
         df = deduplicate(df, keys=keys if keys else ("店名","日付"), ts_col=ts_col or "タイムスタンプ")
         after = len(df)
-
         st.caption(f"重複除去: {before - after}件（キー: {keys if keys else ('店名','日付')} / タイムスタンプ最新を採用）")
 
         df = compute_totals(df)
@@ -228,8 +269,26 @@ if go:
         csv = df.to_csv(index=False).encode("utf-8-sig")
         st.download_button("CSVをダウンロード", data=csv, file_name="scores_cleaned.csv", mime="text/csv")
 
+    except SpreadsheetNotFound as e:
+        st.error("スプレッドシートにアクセスできません（404）。IDが誤っているか、サービスアカウントに共有が付いていません。"
+                 " → 対策: 該当シートをサイドバーに表示された SA のメールアドレスに Viewer 共有してください。")
+        st.exception(e)
+    except WorksheetNotFound as e:
+        st.error(f"指定のワークシート（タブ）が見つかりません: {ws_name}")
+        try:
+            # 候補を提示
+            creds2 = Credentials.from_service_account_info(
+                creds, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
+            )
+            gc2 = gspread.authorize(creds2)
+            sh2 = gc2.open_by_key(sid)
+            titles = [w.title for w in sh2.worksheets()]
+            st.info(f"利用可能なタブ: {titles}")
+        except Exception:
+            pass
+        st.exception(e)
     except Exception as e:
         st.exception(e)
 
 st.markdown("---")
-st.write("💡 *Yes* の味フィルターのみをプロット。境界は 30 点（10項目×3）。見出しのゆらぎは自動で正規化します。")
+st.write("💡 *Yes* 系の味フィルターのみをプロット。境界は 30 点（10項目×3）。見出しのゆらぎは自動正規化＋エイリアスで吸収します。")
