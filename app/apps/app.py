@@ -12,6 +12,9 @@ from gspread.exceptions import SpreadsheetNotFound, WorksheetNotFound
 from pathlib import Path
 
 # ========================= 日本語フォントの有効化（最小パッチ） =========================
+FONT_DIR = Path(__file__).parent / "fonts"
+JP_FONT = FONT_DIR / "NotoSansJP-Regular.ttf"
+
 try:
     if JP_FONT.exists():
         font_manager.fontManager.addfont(str(JP_FONT))
