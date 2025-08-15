@@ -11,10 +11,27 @@ from gspread_dataframe import get_as_dataframe
 from gspread.exceptions import SpreadsheetNotFound, WorksheetNotFound
 from pathlib import Path
 
-# ========================= 日本語フォント =========================
-# 1) まずはプロジェクト同梱の日本語フォントを最優先で使う
-FONT_DIR = Path(__file__).parent / "fonts"
-JP_FONT = FONT_DIR / "NotoSansJP-Regular.ttf"  # 同梱したファイル名に合わせて
+# ========================= 日本語フォントの有効化（最小パッチ） =========================
+try:
+    if JP_FONT.exists():
+        font_manager.fontManager.addfont(str(JP_FONT))
+        # 追加フォントを検索対象に反映
+        try:
+            font_manager._rebuild()
+        except Exception:
+            pass
+        # 追加したTTFの内部フォント名を取得して、sans-serif の先頭に据える
+        jp_name = font_manager.FontProperties(fname=str(JP_FONT)).get_name()
+        rcParams["font.family"] = "sans-serif"
+        rcParams["font.sans-serif"] = [jp_name, "DejaVu Sans", "Arial", "Liberation Sans"]
+    else:
+        # 同梱フォントが無いときの最後の砦
+        rcParams["font.family"] = "DejaVu Sans"
+    rcParams["axes.unicode_minus"] = False
+except Exception:
+    rcParams["font.family"] = "DejaVu Sans"
+    rcParams["axes.unicode_minus"] = False
+
 
 # ========================= 評価定義 =========================
 DIVERSITY_COLS = [
