@@ -1,10 +1,8 @@
 # app.py — PCA対応版：Excel/Sheets → 前処理 → PCA(SVD) → 可視化
-# たけしゃん用 完全版（ServiceAccount：secrets優先／サイドバー貼付けも可）
-# ベクトル図：ラベルを外側に出し、矢印で結び、簡易リペルで重なりを緩和
+# ラベル重なり解消：極座標リペル（角度間隔の最小化）＋外周配置
 
-import os, re, json, unicodedata, math
+import os, re, json, unicodedata
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -22,28 +20,7 @@ st.set_page_config(
 )
 
 # ============================================================
-# フォント（日本語表示の安定化）
-# ============================================================
-FONT_DIR = Path(__file__).parent / "fonts"
-JP_FONT = FONT_DIR / "NotoSansJP-Regular.ttf"  # 任意で同梱可
-try:
-    if JP_FONT.exists():
-        font_manager.fontManager.addfont(str(JP_FONT))
-        try: font_manager._rebuild()
-        except Exception: pass
-        jp_name = font_manager.FontProperties(fname=str(JP_FONT)).get_name()
-        rcParams["font.family"] = "sans-serif"
-        rcParams["font.sans-serif"] = [jp_name, "DejaVu Sans", "Arial", "Liberation Sans"]
-    else:
-        # ローカルの日本語フォントがある場合は適宜追記可
-        rcParams["font.family"] = "DejaVu Sans"
-    rcParams["axes.unicode_minus"] = False
-except Exception:
-    rcParams["font.family"] = "DejaVu Sans"
-    rcParams["axes.unicode_minus"] = False
-
-# ============================================================
-# 旧マトリクス用列（参考）
+# 旧マトリクス用列（多様性/ブランド防衛スコアの集計用）
 # ============================================================
 DIVERSITY_COLS = [
     "多様性1_メニューの独自性","多様性2_内装の個性","多様性3_店主・スタッフのキャラ","多様性4_サービス独自性",
@@ -55,10 +32,30 @@ BRAND_COLS = [
     "防衛5_提供スピード","防衛6_支払いの安全性","防衛7_入店しやすさ","防衛8_初見客への対応",
     "防衛9_常連/口コミ","防衛10_リスク対応力"
 ]
-MIDLINE = 30
+MIDLINE = 30  # マトリクスの基準線
 
 # ============================================================
-# 列名正規化
+# 日本語フォント（任意で fonts/NotoSansJP-Regular.ttf を同梱）
+# ============================================================
+FONT_DIR = Path(__file__).parent / "fonts"
+JP_FONT = FONT_DIR / "NotoSansJP-Regular.ttf"
+try:
+    if JP_FONT.exists():
+        font_manager.fontManager.addfont(str(JP_FONT))
+        try: font_manager._rebuild()
+        except Exception: pass
+        jp_name = font_manager.FontProperties(fname=str(JP_FONT)).get_name()
+        rcParams["font.family"] = "sans-serif"
+        rcParams["font.sans-serif"] = [jp_name, "DejaVu Sans", "Arial", "Liberation Sans"]
+    else:
+        rcParams["font.family"] = "DejaVu Sans"
+    rcParams["axes.unicode_minus"] = False
+except Exception:
+    rcParams["font.family"] = "DejaVu Sans"
+    rcParams["axes.unicode_minus"] = False
+
+# ============================================================
+# 列名正規化まわり
 # ============================================================
 def _norm(s: str) -> str:
     s = unicodedata.normalize("NFKC", str(s))
@@ -217,7 +214,7 @@ def wide_from_long(df_long: pd.DataFrame) -> pd.DataFrame:
     return coerce_1to5(wide)
 
 # ============================================================
-# Google 認証：secrets から自動取得（無ければ None）
+# Google 認証：secrets/貼付けの両対応
 # ============================================================
 def get_service_account_from_secrets() -> dict | None:
     try:
@@ -245,7 +242,6 @@ def get_service_account_from_secrets() -> dict | None:
     except Exception:
         return None
 
-# ---- 追加：貼り付け文字列のパース（JSON/TOML風どちらもOK）
 def parse_service_account_text(text: str) -> dict | None:
     if not text or not text.strip():
         return None
@@ -255,7 +251,7 @@ def parse_service_account_text(text: str) -> dict | None:
         data = json.loads(raw)
     except Exception:
         data = None
-    # 2) key="value" 形式
+    # 2) TOML/INI風 key="value"
     if data is None and "=" in raw and "{" not in raw:
         kv = {}
         for line in raw.splitlines():
@@ -319,6 +315,7 @@ def extract_sheet_id(text: str) -> str:
     return m.group(1) if m else t
 
 def read_from_sheets(creds_dict, sheet_id, worksheet) -> pd.DataFrame:
+    # 依存ライブラリは関数内 import（未使用時は不要）
     import gspread
     from google.oauth2.service_account import Credentials
     from gspread_dataframe import get_as_dataframe
@@ -353,6 +350,7 @@ def pca_svd(df_items: pd.DataFrame):
     for c in X.columns:
         col = pd.to_numeric(X[c], errors="coerce")
         X[c] = col.fillna(col.mean(skipna=True))
+    # 定数列/重複列の除去
     X = X.loc[:, X.var() > 1e-12]
     X = X.loc[:, ~X.T.duplicated()]
     mu = X.mean(axis=0)
@@ -395,72 +393,96 @@ def draw_matrix_plot(df: pd.DataFrame, show_all: bool, show_labels: bool, max_la
     st.dataframe(shown, use_container_width=True)
 
 # ============================================================
-# ベクトル図：外側ラベリング＋簡易リペル
+# ベクトル図：極座標リペル（角度最小間隔）＋外周配置
 # ============================================================
-def draw_loading_vectors(loadings: pd.DataFrame, max_vec: int, label_scale: float, arrow_scale: float,
-                         repel_iter: int = 80, repel_eps: float = 0.035, use_arrows=True):
+def draw_loading_vectors(loadings: pd.DataFrame,
+                         max_vec: int = 15,
+                         arrow_scale: float = 1.4,
+                         radius_mode: str = "auto",    # "auto" or "fixed"
+                         label_scale: float = 1.5,      # auto時：ベクトル先端×倍率
+                         fixed_radius: float = 1.6,     # fixed時：外周半径（データ座標）
+                         min_angle_deg: float = 10.0,   # ラベル間の最小角度
+                         use_guides: bool = True):
     """
-    label_scale: ラベル配置半径（ベクトル先端の何倍の距離に配置するか）
-    arrow_scale: 矢印長の倍率（見やすさ用にベクトル自体を拡大）
-    repel_iter: 反発計算の反復回数
-    repel_eps : ラベル同士の最小距離（埋め込み座標系での距離）
+    - ベクトルは原点→(PC1,PC2)*arrow_scale
+    - ラベルは外周に角度順で並べ、隣接ラベルの角度間隔を min_angle_deg 以上に調整
+    - ラベル位置は radius_mode:
+        * "auto": ベクトル先端からさらに label_scale 倍外側
+        * "fixed": すべて fixed_radius の円周上に載せる
     """
+    if not {"PC1","PC2"}.issubset(loadings.columns):
+        fig, ax = plt.subplots(figsize=(9, 7), dpi=120)
+        ax.text(0.5, 0.5, "PC2 が計算できなかったため\nベクトル図は省略します。", ha="center", va="center", fontsize=12)
+        ax.axis("off")
+        return fig
+
     fig, ax = plt.subplots(figsize=(9, 7), dpi=120)
     ax.axhline(0, lw=1, color="gray", alpha=0.6)
     ax.axvline(0, lw=1, color="gray", alpha=0.6)
-    ax.set_xlim(-1.2*arrow_scale, 1.2*arrow_scale)
-    ax.set_ylim(-1.2*arrow_scale, 1.2*arrow_scale)
-    ax.set_xlabel("PC1 loading")
-    ax.set_ylabel("PC2 loading")
+    lim = 1.2 * max(1.0, arrow_scale, fixed_radius if radius_mode=="fixed" else 1.0)
+    ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim)
+    ax.set_xlabel("PC1 loading"); ax.set_ylabel("PC2 loading")
     ax.set_title("項目ベクトル（負荷量）")
 
+    # 上位ベクトル抽出
     L = loadings[["PC1","PC2"]].copy()
     L["_mag"] = np.sqrt(L["PC1"]**2 + L["PC2"]**2)
     L = L.sort_values("_mag", ascending=False).head(max(1, int(max_vec)))
 
-    # 矢印（拡大表示）
+    # ベクトル（拡大）
+    tips = []
     for item, row in L.iterrows():
         x, y = float(row["PC1"])*arrow_scale, float(row["PC2"])*arrow_scale
         ax.arrow(0, 0, x, y, head_width=0.03*arrow_scale, length_includes_head=True, alpha=0.9)
+        tips.append((item, x, y))
 
-    # 初期ラベル位置：ベクトル方向へ label_scale 倍
-    labels = L.index.to_list()
-    tips   = L[["PC1","PC2"]].values * arrow_scale
-    pos    = tips * label_scale
-
-    # 簡易リペル：互いに押し合って重なりを避ける
-    for _ in range(repel_iter):
-        moved = False
-        for i in range(len(pos)):
-            for j in range(i+1, len(pos)):
-                dx, dy = pos[i] - pos[j]
-                dist2 = dx*dx + dy*dy
-                if dist2 == 0:
-                    dx = (np.random.rand()-0.5)*1e-3
-                    dy = (np.random.rand()-0.5)*1e-3
-                    dist2 = dx*dx + dy*dy
-                if dist2 < repel_eps**2:
-                    force = (repel_eps/np.sqrt(dist2) - 1.0) * 0.015
-                    ux, uy = dx/np.sqrt(dist2), dy/np.sqrt(dist2)
-                    pos[i] += np.array([ux, uy]) * force
-                    pos[j] -= np.array([ux, uy]) * force
-                    moved = True
-        if not moved:
-            break
-
-    # ラベル描画（矢印線で先端と接続）
-    for (x_tip, y_tip), (x_lab, y_lab), label in zip(tips, pos, labels):
-        if use_arrows:
-            ax.annotate(
-                str(label),
-                xy=(x_tip, y_tip),
-                xytext=(x_lab, y_lab),
-                arrowprops=dict(arrowstyle="->", lw=0.6, alpha=0.8),
-                fontsize=9,
-                ha="center", va="center"
-            )
+    # 角度（-pi,pi] に正規化
+    data = []
+    for item, x, y in tips:
+        theta = np.arctan2(y, x)  # -pi..pi
+        r_tip = np.hypot(x, y)
+        if radius_mode == "fixed":
+            r_lbl = fixed_radius
         else:
-            ax.text(x_lab, y_lab, str(label), fontsize=9)
+            r_lbl = max(r_tip * label_scale, r_tip + 0.05)  # 先端より外側
+        data.append([item, x, y, theta, r_tip, r_lbl])
+
+    # 角度でソート → 最小角度間隔を確保（一周分で調整）
+    data.sort(key=lambda z: z[3])  # theta
+    min_d = np.deg2rad(min_angle_deg)
+
+    thetas = np.array([d[3] for d in data], dtype=float)
+    thetas_wrapped = thetas.copy()
+    for i in range(1, len(thetas_wrapped)):
+        if thetas_wrapped[i] - thetas_wrapped[i-1] < min_d:
+            thetas_wrapped[i] = thetas_wrapped[i-1] + min_d
+    # 端と端（循環）の間隔も調整
+    total_span = thetas_wrapped[-1] - thetas_wrapped[0]
+    if total_span < 2*np.pi - min_d:
+        need = (2*np.pi - min_d) - total_span
+        shift_each = need / 2.0
+        thetas_wrapped[0] -= shift_each
+        thetas_wrapped[-1] += shift_each
+
+    # 角度を -pi..pi に戻す
+    thetas_adj = ((thetas_wrapped + np.pi) % (2*np.pi)) - np.pi
+
+    # ラベル配置と矢印（先端→ラベル）
+    for theta, d in zip(thetas_adj, data):
+        item, x_tip, y_tip, _, _, r_lbl = d
+        x_lbl, y_lbl = r_lbl*np.cos(theta), r_lbl*np.sin(theta)
+        ax.annotate(
+            str(item),
+            xy=(x_tip, y_tip),
+            xytext=(x_lbl, y_lbl),
+            arrowprops=dict(arrowstyle="->", lw=0.7, alpha=0.85),
+            fontsize=9, ha="center", va="center"
+        )
+
+    if use_guides:
+        circle = plt.Circle((0,0), radius=(fixed_radius if radius_mode=="fixed" else 1.05*arrow_scale),
+                            fill=False, linestyle="--", linewidth=0.6, alpha=0.35)
+        ax.add_artist(circle)
 
     return fig
 
@@ -474,36 +496,22 @@ with st.sidebar:
     source = st.radio("選択", ["Excelアップロード", "Googleスプレッドシート"], index=1, key="source_kind")
 
     uploaded = None
-    creds_dict = None
-
     if source == "Excelアップロード":
         uploaded = st.file_uploader("Excelファイル（.xlsx）を選択", type=["xlsx"], key="xlsx_uploader")
         st.caption("縦持ち（Section/評価項目/スコア…）でも横持ち（各項目が列）でもOK。")
-        sheet_id_input = ""
-        ws_name_input  = ""
+        sheet_id_input = ""; ws_name_input  = ""
     else:
-        creds_dict = get_service_account_from_secrets()  # あれば自動
-        sheet_id_input = st.text_input(
-            "Spreadsheet ID / URL",
-            value=st.secrets.get("gcp", {}).get("sheet_id", ""),
-            key="sheet_id"
-        )
-        ws_name_input = st.text_input(
-            "Worksheet名（タブ名）",
-            value=st.secrets.get("gcp", {}).get("worksheet", "Form Responses"),
-            key="worksheet_name"
-        )
-        if creds_dict:
-            st.success("Service Account: secrets から自動読込 ✅")
-        else:
-            st.warning("secrets.toml の [gcp] が未設定です。下に貼り付ければ使用できます。")
+        sheet_id_input = st.text_input("Spreadsheet ID / URL", value=st.secrets.get("gcp", {}).get("sheet_id", ""), key="sheet_id")
+        ws_name_input  = st.text_input("Worksheet名（タブ名）", value=st.secrets.get("gcp", {}).get("worksheet", "Form Responses"), key="worksheet_name")
         st.text_area("Service Account JSON（貼り付け）", height=160, key="svc_json")
 
-    st.header("PCA 設定")
-    show_vectors = st.checkbox("項目ベクトルを重ね描画（最大30）", value=True, key="show_vectors")
+    st.header("PCA 設定（ベクトル図）")
     max_vec = st.slider("ベクトルの最大表示本数", 0, 30, 15, 1, key="max_vec")
-    arrow_scale = st.slider("ベクトル拡大倍率（図の広がり）", 1.0, 2.5, 1.4, 0.1, key="arrow_scale")
-    label_scale = st.slider("ラベル外側倍率（先端からの距離）", 1.05, 2.0, 1.45, 0.05, key="label_scale")
+    arrow_scale = st.slider("ベクトル拡大倍率（広がり）", 1.0, 2.5, 1.4, 0.1, key="arrow_scale")
+    label_mode = st.radio("ラベル半径モード", ["自動（先端から外側）", "固定（外周円に揃える）"], index=0, key="label_mode")
+    label_scale = st.slider("自動モード：外側倍率", 1.05, 2.0, 1.50, 0.05, key="label_scale")
+    fixed_radius = st.slider("固定モード：外周半径", 1.1, 2.2, 1.6, 0.1, key="fixed_radius")
+    min_angle_deg = st.slider("最小角度間隔（ラベル同士）", 4, 22, 10, 1, key="min_angle_deg")
 
     st.header("参考：合計点マトリクス")
     show_matrix = st.checkbox("旧マトリクスも描く", value=False, key="show_matrix")
@@ -518,11 +526,11 @@ go = st.button("PCAを実行", type="primary", key="run_pca")
 # ============================================================
 if go:
     try:
+        # データ読込
         if source == "Googleスプレッドシート":
             creds_dict = get_service_account_any()
             if not creds_dict:
-                st.error("認証情報がありません。secrets.toml を設定するか、サイドバーへ公式のService Account JSON（または key=\"value\" 形式）を貼り付けてください。")
-                st.stop()
+                st.error("認証情報がありません。secrets.toml またはサイドバーへ Service Account JSON を貼り付けてください。"); st.stop()
             if not sheet_id_input:
                 st.error("Spreadsheet ID / URL を入力してください。"); st.stop()
             df_raw = read_from_sheets(creds_dict, sheet_id_input, ws_name_input)
@@ -548,37 +556,41 @@ if go:
         if len(numeric_cols) < 3:
             st.error(f"数値の評価項目が少なすぎます（見つかった数: {len(numeric_cols)}、3列以上が望ましい）。"); st.stop()
 
+        # PCA
         df_items = df_raw[numeric_cols].copy()
         scores_df, loadings, ev, ev_ratio = pca_svd(df_items)
 
-        # ── 散布図（PC1×PC2）
-        fig, ax = plt.subplots(figsize=(9, 7), dpi=120)
-        xy = scores_df[["PC1","PC2"]].values
-        ax.scatter(xy[:,0], xy[:,1], s=60, alpha=0.9)
-        for i, name in enumerate(df_raw["店名"].astype(str).values):
-            if i < len(xy):
-                ax.annotate(name, (xy[i,0], xy[i,1]), xytext=(4,4), textcoords="offset points", fontsize=9)
-        ax.axhline(0, lw=1, color="gray", alpha=0.6)
-        ax.axvline(0, lw=1, color="gray", alpha=0.6)
-        ax.set_xlabel(f"PC1 ({ev_ratio[0]*100:.1f}% var)")
-        ax.set_ylabel(f"PC2 ({ev_ratio[1]*100:.1f}% var)")
-        ax.set_title("PCA マップ（店舗の位置：PC1×PC2）")
-        st.pyplot(fig, clear_figure=True)
+        # 散布図（PC1×PC2）
+        if {"PC1","PC2"}.issubset(scores_df.columns):
+            fig, ax = plt.subplots(figsize=(9, 7), dpi=120)
+            xy = scores_df[["PC1","PC2"]].values
+            ax.scatter(xy[:,0], xy[:,1], s=60, alpha=0.9)
+            for i, name in enumerate(df_raw["店名"].astype(str).values):
+                if i < len(xy):
+                    ax.annotate(name, (xy[i,0], xy[i,1]), xytext=(4,4), textcoords="offset points", fontsize=9)
+            ax.axhline(0, lw=1, color="gray", alpha=0.6)
+            ax.axvline(0, lw=1, color="gray", alpha=0.6)
+            ax.set_xlabel(f"PC1 ({ev_ratio[0]*100:.1f}% var)")
+            ax.set_ylabel(f"PC2 ({ev_ratio[1]*100:.1f}% var)")
+            ax.set_title("PCA マップ（店舗の位置：PC1×PC2）")
+            st.pyplot(fig, clear_figure=True)
+        else:
+            st.info("サンプル数や項目の都合でPC2が得られませんでした。散布図は省略します。")
 
-        # ── ベクトル（負荷量）：外側ラベリング＋簡易リペル
-        if {"PC1","PC2"}.issubset(loadings.columns) and st.session_state.get("show_vectors", True):
-            fig2 = draw_loading_vectors(
-                loadings=loadings,
-                max_vec=int(st.session_state.get("max_vec", 15)),
-                label_scale=float(st.session_state.get("label_scale", 1.45)),
-                arrow_scale=float(st.session_state.get("arrow_scale", 1.4)),
-                repel_iter=100,
-                repel_eps=0.04,
-                use_arrows=True
-            )
-            st.pyplot(fig2, clear_figure=True)
+        # ベクトル図（重なり無し版）
+        fig2 = draw_loading_vectors(
+            loadings=loadings,
+            max_vec=int(max_vec),
+            arrow_scale=float(arrow_scale),
+            radius_mode=("fixed" if label_mode.startswith("固定") else "auto"),
+            label_scale=float(label_scale),
+            fixed_radius=float(fixed_radius),
+            min_angle_deg=float(min_angle_deg),
+            use_guides=True,
+        )
+        st.pyplot(fig2, clear_figure=True)
 
-        # ── テーブル
+        # テーブル
         st.subheader("寄与率")
         var_df = pd.DataFrame({
             "PC": [f"PC{i+1}" for i in range(len(ev_ratio))],
@@ -604,20 +616,14 @@ if go:
                            file_name="pca_scores_by_store.csv", mime="text/csv")
 
         # 参考：旧マトリクス
-        if st.session_state.get("show_matrix", False):
+        if show_matrix:
             df_old = df_raw.copy()
             if set(DIVERSITY_COLS).issubset(df_old.columns) and set(BRAND_COLS).issubset(df_old.columns):
                 df_old["多様性合計"] = df_old[DIVERSITY_COLS].sum(axis=1)
                 df_old["防衛合計"] = df_old[BRAND_COLS].sum(axis=1)
-                draw_matrix_plot(
-                    df_old,
-                    show_all=st.session_state.get("show_all", False),
-                    show_labels=st.session_state.get("show_labels", True),
-                    max_labels=st.session_state.get("max_labels", 50),
-                )
+                draw_matrix_plot(df_old, show_all, show_labels, max_labels)
             else:
                 st.info("旧マトリクス用の列がないため、参考図は割愛しました。")
 
     except Exception as e:
         st.exception(e)
-
