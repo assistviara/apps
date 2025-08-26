@@ -1,5 +1,6 @@
 # app.py — PCA対応版：Excel/Sheets → 前処理 → PCA(SVD) → 可視化
-# ラベル重なり解消：角度リペル（文字長考慮）＋ 段組み半径ずらし ＋ 自動改行（全角12字・最大10行）
+# ラベル重なり解消：角度リペル（文字長＋行数）＋ 段組み半径ずらし ＋ 自動改行 ＋
+#                     近似バウンディング（角度幅×半径帯）で当たり判定→半径押し出し
 
 import os, re, json, unicodedata
 from pathlib import Path
@@ -373,7 +374,7 @@ def draw_matrix_plot(df: pd.DataFrame, show_all: bool, show_labels: bool, max_la
     st.dataframe(shown, use_container_width=True)
 
 # ============================================================
-# ベクトル図：角度リペル（文字長対応）＋ 段組み半径ずらし ＋ 自動改行
+# ベクトル図：衝突なし配置（角度×半径の近似バウンディングで回避）
 # ============================================================
 def draw_loading_vectors(loadings: pd.DataFrame,
                          max_vec: int = 15,
@@ -381,16 +382,17 @@ def draw_loading_vectors(loadings: pd.DataFrame,
                          radius_mode: str = "auto",      # "auto" or "fixed"
                          label_scale: float = 1.5,        # auto時：先端×倍率
                          fixed_radius: float = 1.8,       # fixed時：外周半径（データ座標）
-                         min_angle_deg: float = 12.0,     # 最低角度間隔の下限
+                         min_angle_deg: float = 12.0,     # 最低角度間隔の下限（横幅の下限）
                          char_deg_per_char: float = 1.8,  # 1文字あたり必要な角度（度）
-                         radial_stagger: float = 0.14,    # 段組みの半径ずらし量
-                         wrap_width_zen: int = 12,        # 全角換算の改行幅
+                         radial_stagger: float = 0.14,    # 基本の段組みずらし量
+                         wrap_width_zen: int = 12,        # 自動改行の幅（全角換算）
                          wrap_max_lines: int = 10,        # 改行の最大行数
                          use_guides: bool = True):
     """
-    - 角度リペル：前のラベルから “min_angle_deg + char_deg_per_char * 文字数” だけ間隔を空ける
-    - 段組み：奇数番・偶数番でラベル半径を ±radial_stagger だけ交互にずらす
-    - 自動改行：wrap_width_zen / wrap_max_lines
+    改善点：
+      1) 自動改行後の「行数」を考慮して必要角度を増やす（行が増えるほど角度幅が必要）
+      2) 各ラベルを「角度幅×半径帯」の矩形として近似し、既配置ラベルと衝突チェック
+         衝突すれば半径方向に押し出して、重なりを解消（当たり判定は極座標上）
     """
     if not {"PC1","PC2"}.issubset(loadings.columns):
         fig, ax = plt.subplots(figsize=(9, 7), dpi=120)
@@ -418,49 +420,102 @@ def draw_loading_vectors(loadings: pd.DataFrame,
         ax.arrow(0, 0, x, y, head_width=0.03*arrow_scale, length_includes_head=True, alpha=0.9)
         tips.append((str(item), x, y))
 
-    # 角度＆基本半径
+    # ラベル情報（角度・半径・改行済みテキスト・行数・文字数）
     raw = []
     for label, x, y in tips:
         theta = np.arctan2(y, x)  # -pi..pi
         r_tip = np.hypot(x, y)
-        r_lbl = (fixed_radius if radius_mode=="fixed" else max(r_tip * label_scale, r_tip + 0.05))
-        raw.append([label, x, y, theta, r_tip, r_lbl, len(label)])
+        r_lbl = (fixed_radius if radius_mode=="fixed" else max(r_tip * label_scale, r_tip + 0.3))
+        wrapped = wrap_japanese_label(label, max_width=wrap_width_zen, max_lines=wrap_max_lines)
+        lines = wrapped.split("\n")
+        line_count = len(lines)
+        char_count = max(len(s) for s in lines) if lines else len(label)
+        raw.append({
+            "label": label,
+            "wrapped": wrapped,
+            "theta": float(theta),
+            "r_tip": float(r_tip),
+            "r_lbl": float(r_lbl),
+            "line_count": int(line_count),
+            "char_count": int(char_count)
+        })
 
     # 角度でソート
-    raw.sort(key=lambda z: z[3])
-    # 角度リペル（文字長考慮）
-    thetas = np.array([d[3] for d in raw], dtype=float)
-    need_gap_deg = np.array([min_angle_deg + char_deg_per_char * d[6] for d in raw], dtype=float)
-    need_gap = np.deg2rad(need_gap_deg)
-    adj = thetas.copy()
+    raw.sort(key=lambda d: d["theta"])
+
+    # ---- 角度リペル（横方向）：文字数＋行数で必要角度を増やす
+    # 行数が増えると箱の高さが上がり、上下の行のずれで見かけの幅も広がるため、係数を少し足す
+    base_deg = np.array([min_angle_deg + char_deg_per_char * d["char_count"] + 0.6*(d["line_count"]-1)
+                         for d in raw], dtype=float)
+    need_gap = np.deg2rad(base_deg)
+
+    adj = np.array([d["theta"] for d in raw], dtype=float)
     for i in range(1, len(adj)):
         gap = adj[i] - adj[i-1]
         min_need = max(need_gap[i], need_gap[i-1]*0.6)
         if gap < min_need:
             adj[i] = adj[i-1] + min_need
-    # 循環端（先頭↔末尾）
-    total_span = adj[-1] - adj[0]
-    ring_need = max(need_gap[0], need_gap[-1])
-    if total_span < 2*np.pi - ring_need:
+
+    # 端面（−π..π）をまたぐ場合の調整
+    total_span = adj[-1] - adj[0] if len(adj) >= 2 else 0.0
+    ring_need = max(need_gap[0], need_gap[-1]) if len(adj) >= 2 else 0.0
+    if len(adj) >= 2 and total_span < 2*np.pi - ring_need:
         delta = (2*np.pi - ring_need - total_span) / 2.0
         adj[0] -= delta; adj[-1] += delta
-    # -pi..pi に戻す
-    thetas_adj = ((adj + np.pi) % (2*np.pi)) - np.pi
+    thetas_adj = ((adj + np.pi) % (2*np.pi)) - np.pi  # 戻す
 
-    # 段組み（半径ずらし）
+    # ---- 段組み＋当たり判定で半径方向の押し出し（縦方向）
+    # ラベルの縦サイズを「行数×行高」で近似。行高はデータ座標（半径）で ~0.10 を基準に。
+    line_height = 0.10
+    placed = []  # 既配置の「角度中心・角度半幅・半径中心・半径半幅」のタプル群
+
     for i, d in enumerate(raw):
-        extra = radial_stagger * (1.0 + (need_gap_deg[i] > (min_angle_deg + char_deg_per_char*8)) * 0.25)
-        raw[i][5] = raw[i][5] + (extra if i % 2 == 0 else -extra)
-        raw[i][5] = max(raw[i][5], 0.9)
+        theta = float(thetas_adj[i])
+        # 段組み（軽いずらし）
+        r_lbl = d["r_lbl"] + (radial_stagger if i % 2 == 0 else -radial_stagger)
+        r_lbl = max(r_lbl, 0.9)
 
-    # ラベル描画（先端→ラベル）
-    for theta, d in zip(thetas_adj, raw):
-        label, x_tip, y_tip, _, _, r_lbl, _ = d
-        x_lbl, y_lbl = r_lbl*np.cos(theta), r_lbl*np.sin(theta)
-        label_wrapped = wrap_japanese_label(label, max_width=wrap_width_zen, max_lines=wrap_max_lines)
+        # 角度方向の半幅（文字数由来の角度幅を半分に）
+        ang_half = 0.5 * need_gap[i]
+
+        # 半径方向の半幅（行数由来の高さを半分に）
+        rad_half = 0.5 * (line_height * d["line_count"])
+
+        # 既配置と衝突する間は半径を少しずつ押し出す
+        def overlap(a, b):
+            # 角度は円なので、差の最小値を使う
+            a1, a2 = a["theta"]-a["ang_half"], a["theta"]+a["ang_half"]
+            b1, b2 = b["theta"]-b["ang_half"], b["theta"]+b["ang_half"]
+            # 角度区間を 0..2π に正規化して重なりチェック
+            def norm_int(lo, hi):
+                lo = (lo + np.pi) % (2*np.pi)
+                hi = (hi + np.pi) % (2*np.pi)
+                if lo <= hi: return [(lo, hi)]
+                else: return [(0, hi), (lo, 2*np.pi)]
+            A = norm_int(a1, a2)
+            B = norm_int(b1, b2)
+            angle_overlaps = any(not (x2 < y1 or y2 < x1) for (x1,x2) in A for (y1,y2) in B)
+            if not angle_overlaps: return False
+            # 半径帯の重なり
+            return not (a["r"]+a["rad_half"] < b["r"]-b["rad_half"] or
+                        b["r"]+b["rad_half"] < a["r"]-a["rad_half"])
+
+        # 押し出しループ（最大反復は安全のため上限）
+        max_push = 200
+        push_step = 0.06  # 少しずつ外へ
+        box = {"theta": theta, "ang_half": ang_half, "r": r_lbl, "rad_half": rad_half}
+        tries = 0
+        while any(overlap(box, q) for q in placed) and tries < max_push:
+            box["r"] += push_step
+            tries += 1
+
+        placed.append(box)
+
+        # 実描画
+        x_lbl, y_lbl = box["r"] * np.cos(theta), box["r"] * np.sin(theta)
         ax.annotate(
-            label_wrapped,
-            xy=(x_tip, y_tip),
+            d["wrapped"],
+            xy=(tips[i][1], tips[i][2]),
             xytext=(x_lbl, y_lbl),
             arrowprops=dict(arrowstyle="->", lw=0.7, alpha=0.85),
             fontsize=9, ha="center", va="center"
@@ -563,7 +618,7 @@ if go:
         else:
             st.info("サンプル数や項目の都合でPC2が得られませんでした。散布図は省略します。")
 
-        # ベクトル図（重なり抑制＋改行）
+        # ベクトル図（重なり抑制＋改行＋当たり判定）
         fig2 = draw_loading_vectors(
             loadings=loadings,
             max_vec=int(max_vec),
@@ -572,7 +627,6 @@ if go:
             label_scale=float(label_scale),
             fixed_radius=float(fixed_radius),
             min_angle_deg=float(min_angle_deg),
-            # ここは既定値で 全角12字／10行
             wrap_width_zen=12,
             wrap_max_lines=10,
             use_guides=True,
