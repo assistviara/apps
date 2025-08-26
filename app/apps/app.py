@@ -23,10 +23,43 @@ st.set_page_config(
 load_dotenv()
 DEFAULT_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
 DEFAULT_WS_NAME  = os.getenv("GSHEET_WORKSHEET", "Form Responses")
-DEFAULT_SVC_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-DEFAULT_SVC_JSON_PATH = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_PATH", "")
 
-# ===== 日本語フォント設定 =====
+# ===== secrets.toml を優先 =====
+try:
+    if "gcp" in st.secrets:
+        DEFAULT_SHEET_ID = st.secrets["gcp"].get("sheet_id", DEFAULT_SHEET_ID or "")
+        DEFAULT_WS_NAME  = st.secrets["gcp"].get("worksheet", DEFAULT_WS_NAME or "Form Responses")
+except Exception:
+    pass
+
+# ===== Service Account 取得 =====
+def get_service_account_from_secrets() -> dict | None:
+    try:
+        if "gcp" in st.secrets:
+            g = st.secrets["gcp"]
+            required = [
+                "type","project_id","private_key_id","private_key",
+                "client_email","client_id","token_uri"
+            ]
+            if all(k in g for k in required):
+                return {
+                    "type": g["type"],
+                    "project_id": g["project_id"],
+                    "private_key_id": g["private_key_id"],
+                    "private_key": g["private_key"],  # 改行そのまま
+                    "client_email": g["client_email"],
+                    "client_id": g["client_id"],
+                    "auth_uri": g.get("auth_uri","https://accounts.google.com/o/oauth2/auth"),
+                    "token_uri": g.get("token_uri","https://oauth2.googleapis.com/token"),
+                    "auth_provider_x509_cert_url": g.get("auth_provider_x509_cert_url","https://www.googleapis.com/oauth2/v1/certs"),
+                    "client_x509_cert_url": g.get("client_x509_cert_url",""),
+                    "universe_domain": g.get("universe_domain","googleapis.com"),
+                }
+    except Exception:
+        pass
+    return None
+
+# ===== 日本語フォント（任意） =====
 FONT_DIR = Path(__file__).parent / "fonts"
 JP_FONT = FONT_DIR / "NotoSansJP-Regular.ttf"
 try:
@@ -44,7 +77,7 @@ except Exception:
     rcParams["font.family"] = "DejaVu Sans"
     rcParams["axes.unicode_minus"] = False
 
-# ===== 必須列定義 =====
+# ===== 旧マトリクス用列 =====
 DIVERSITY_COLS = [
     "多様性1_メニューの独自性","多様性2_内装の個性","多様性3_店主・スタッフのキャラ","多様性4_サービス独自性",
     "多様性5_地域性の反映","多様性6_イベント/季節","多様性7_SNSのユニークさ","多様性8_客層の多様性",
@@ -57,47 +90,19 @@ BRAND_COLS = [
 ]
 MIDLINE = 30
 
-# ===== 列名正規化ルール =====
+# ===== 正規化ルール =====
 def _norm(s: str) -> str:
     s = unicodedata.normalize("NFKC", str(s))
     return s.replace(" ", "").replace("　", "").lower()
 
-ALIAS_COLS = {
-    "店名": ["店名","お店名","店舗名","ショップ名","店舗"],
-    "日付": ["日付","訪問日","来店日","日時"],
-    "評価項目": ["評価項目","項目","質問","質問文"],
-    "スコア": ["スコア","点数","評価","score","得点"],
-    "コメント": ["コメント","自由記述","メモ","備考","自由回答"],
-    "セクション": ["section","セクション","区分","カテゴリ","カテゴリー"]
-}
-
 NORMALIZE_RULES = {
-    "タイムスタンプ": "タイムスタンプ",
-    "訪問日": "日付", "お店名": "店名", "店名": "店名",
-    "step0": "味フィルター（必要条件）", "step 0": "味フィルター（必要条件）",
-    "味フィルター": "味フィルター（必要条件）",
-    # 多様性
-    "メニューの独自性": "多様性1_メニューの独自性",
     "内装の個性": "多様性2_内装の個性",
-    "店主": "多様性3_店主・スタッフのキャラ", "スタッフ": "多様性3_店主・スタッフのキャラ",
     "サービス独自性": "多様性4_サービス独自性",
-    "地域性": "多様性5_地域性の反映",
-    "イベント": "多様性6_イベント/季節",
-    "sns": "多様性7_SNSのユニークさ",
     "客層": "多様性8_客層の多様性",
-    "提供方法": "多様性9_提供方法の特異性",
-    "物語性": "多様性10_店の物語性",
-    # 防衛
-    "味の信頼感": "防衛1_味の信頼感（初訪）",
-    "衛生": "防衛2_衛生/清潔感",
-    "接客": "防衛3_接客態度",
     "価格の明確さ": "防衛4_価格の明確さ",
-    "提供スピード": "防衛5_提供スピード",
     "支払い": "防衛6_支払いの安全性",
     "入店しやすさ": "防衛7_入店しやすさ",
-    "初見客": "防衛8_初見客への対応",
     "口コミ": "防衛9_常連/口コミ",
-    "リスク対応力": "防衛10_リスク対応力",
 }
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -113,22 +118,11 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = new_cols
     return df
 
-def find_col(df: pd.DataFrame, logical_name: str) -> str | None:
-    cands = ALIAS_COLS.get(logical_name, [])
-    cols_norm = { _norm(c): c for c in df.columns }
-    for key in cands:
-        k = _norm(key)
-        for cn, orig in cols_norm.items():
-            if k in cn:
-                return orig
-    return None
-
-# ===== DataFrame前処理 =====
 def drop_unnamed_columns(df: pd.DataFrame) -> pd.DataFrame:
     keep = [c for c in df.columns if not str(c).startswith("Unnamed:")]
     return df.loc[:, keep]
 
-def collapse_duplicate_columns(df: pd.DataFrame, agg: str = "mean") -> pd.DataFrame:
+def collapse_duplicate_columns(df: pd.DataFrame, agg="mean") -> pd.DataFrame:
     if df.columns.has_duplicates:
         new_data = {}
         for name in df.columns.unique():
@@ -137,35 +131,15 @@ def collapse_duplicate_columns(df: pd.DataFrame, agg: str = "mean") -> pd.DataFr
                 new_data[name] = block.iloc[:, 0]
             else:
                 block_num = block.apply(pd.to_numeric, errors="coerce")
-                new_series = getattr(block_num, agg)(axis=1, skipna=True)
-                new_data[name] = new_series
+                new_data[name] = block_num.mean(axis=1, skipna=True)
         df = pd.DataFrame(new_data)
     return df
 
 def sanitize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = drop_unnamed_columns(df)
-    new_cols = [unicodedata.normalize("NFKC", str(c)).rstrip("：:").strip() for c in df.columns]
-    df.columns = new_cols
     df = normalize_columns(df)
     df = collapse_duplicate_columns(df, agg="mean")
-    if df.columns.duplicated().any():
-        cols, seen = [], {}
-        for c in df.columns:
-            if c not in seen: seen[c] = 1; cols.append(c)
-            else: seen[c]+=1; cols.append(f"{c}__dup{seen[c]}")
-        df.columns = cols
     return df
-
-# ===== secretsからサービスアカウントを取得 =====
-def get_service_account_from_secrets() -> dict | None:
-    try:
-        if "gcp_service_account" in st.secrets:
-            return dict(st.secrets["gcp_service_account"])
-        if "GOOGLE_SERVICE_ACCOUNT_JSON" in st.secrets:
-            return json.loads(st.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"])
-    except Exception:
-        pass
-    return None
 
 # ===== Google Sheets 読み込み =====
 def extract_sheet_id(text: str) -> str:
@@ -177,7 +151,6 @@ def read_from_sheets(creds_dict, sheet_id, worksheet) -> pd.DataFrame:
     import gspread
     from google.oauth2.service_account import Credentials
     from gspread_dataframe import get_as_dataframe
-
     creds = Credentials.from_service_account_info(
         creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
     )
@@ -188,42 +161,67 @@ def read_from_sheets(creds_dict, sheet_id, worksheet) -> pd.DataFrame:
         ws = sh.worksheet(worksheet)
     except Exception:
         ws = sh.worksheets()[0]
-
     df = get_as_dataframe(ws, evaluate_formulas=True, header=0).dropna(how="all")
     df = sanitize_columns(df)
     return df
+
+# ===== PCA =====
+def pca_svd(df_items: pd.DataFrame):
+    X = df_items.copy()
+    for c in X.columns:
+        col = pd.to_numeric(X[c], errors="coerce")
+        X[c] = col.fillna(col.mean())
+    X = X.loc[:, X.var() > 1e-12]
+    mu = X.mean(axis=0)
+    sd = X.std(axis=0, ddof=1).replace(0, 1.0)
+    Z = (X - mu) / sd
+    U, S, VT = np.linalg.svd(Z, full_matrices=False)
+    eigvals = (S**2) / (Z.shape[0]-1)
+    ev_ratio = eigvals / eigvals.sum()
+    scores = U * S
+    loadings = VT.T
+    scores_df = pd.DataFrame(scores, columns=[f"PC{i+1}" for i in range(scores.shape[1])])
+    loadings_df = pd.DataFrame(loadings, index=X.columns, columns=[f"PC{i+1}" for i in range(loadings.shape[1])])
+    return scores_df, loadings_df, eigvals, ev_ratio
 
 # ===== UI =====
 st.title("飲食店評価：主成分分析（PCA） & マトリクス")
 
 with st.sidebar:
-    st.header("データソース")
-    source = st.radio("選択", ["Excelアップロード", "Googleスプレッドシート"], index=0, key="source_kind")
-
+    source = st.radio("選択", ["Excelアップロード", "Googleスプレッドシート"], index=1)
     uploaded = None
     creds_dict = None
     sheet_id_input = ""
     ws_name_input = ""
 
-    if source == "Excelアップロード":
-        uploaded = st.file_uploader("Excelファイル（.xlsx）を選択", type=["xlsx"], key="xlsx_uploader")
-    else:
-        sheet_id_input = st.text_input("Spreadsheet ID / URL", value=DEFAULT_SHEET_ID, key="sheet_id")
-        ws_name_input  = st.text_input("Worksheet名（タブ名）", value=DEFAULT_WS_NAME, key="worksheet_name")
-
-        svc_from_secrets = get_service_account_from_secrets()
-        if svc_from_secrets:
-            creds_dict = svc_from_secrets
-            st.success("Service Account: st.secrets から自動読込")
-            email = svc_from_secrets.get("client_email", "(no email)")
-            st.caption(f"client_email: {email}")
+    if source == "Googleスプレッドシート":
+        sheet_id_input = st.text_input("Spreadsheet ID / URL", value=DEFAULT_SHEET_ID)
+        ws_name_input  = st.text_input("Worksheet名（タブ名）", value=DEFAULT_WS_NAME)
+        creds_dict = get_service_account_from_secrets()
+        if creds_dict:
+            st.success("Service Account: st.secrets[gcp] から自動読込")
         else:
-            svc_default_text = DEFAULT_SVC_JSON or (Path(DEFAULT_SVC_JSON_PATH).read_text(encoding="utf-8")
-                                if DEFAULT_SVC_JSON_PATH and Path(DEFAULT_SVC_JSON_PATH).exists() else "")
-            svc_text = st.text_area("Service Account JSON（貼り付け）", value=svc_default_text, height=160, key="svc_json")
-            if svc_text.strip():
-                try:
-                    creds_dict = json.loads(svc_text)
-                    st.success("サービスアカウントJSONを読み込みました。")
-                except Exception as e:
-                    st.error(f"JSON解析に失敗: {e}")
+            st.error("Service Account 情報が secrets.toml にありません")
+    else:
+        uploaded = st.file_uploader("Excelファイル（.xlsx）を選択", type=["xlsx"])
+
+go = st.button("PCAを実行", type="primary")
+
+if go:
+    try:
+        if source == "Googleスプレッドシート":
+            df_raw = read_from_sheets(creds_dict, sheet_id_input, ws_name_input)
+        else:
+            df_raw = pd.read_excel(uploaded)
+            df_raw = sanitize_columns(df_raw)
+
+        st.dataframe(df_raw.head(), use_container_width=True)
+
+        numeric_cols = [c for c in df_raw.columns if pd.api.types.is_numeric_dtype(df_raw[c])]
+        df_items = df_raw[numeric_cols].copy()
+        scores_df, loadings, ev, ev_ratio = pca_svd(df_items)
+
+        st.subheader("PCA 結果")
+        st.dataframe(scores_df)
+    except Exception as e:
+        st.exception(e)
