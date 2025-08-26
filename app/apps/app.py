@@ -1,5 +1,5 @@
 # app.py — PCA対応版：Excel/Sheets → 前処理 → PCA(SVD) → 可視化
-# ラベル重なり解消：極座標リペル（角度間隔の最小化）＋外周配置
+# ラベル重なり解消：角度リペル（文字長考慮）＋ 段組み半径ずらし ＋ 自動改行（全角12字・最大10行）
 
 import os, re, json, unicodedata
 from pathlib import Path
@@ -53,6 +53,29 @@ try:
 except Exception:
     rcParams["font.family"] = "DejaVu Sans"
     rcParams["axes.unicode_minus"] = False
+
+# ============================================================
+# ユーティリティ：全角換算で自動改行
+# ============================================================
+def wrap_japanese_label(label: str, max_width: int = 12, max_lines: int = 10) -> str:
+    """
+    日本語ラベルを全角換算で max_width 文字ごとに改行。
+    - 全角: 幅=1、半角: 幅=0.5 としてカウント。
+    - max_lines を超える場合は「…」で打ち切る。
+    """
+    lines, current, cur_w = [], "", 0.0
+    for ch in str(label):
+        w = 1.0 if unicodedata.east_asian_width(ch) in ("F", "W", "A") else 0.5
+        if cur_w + w > max_width:
+            lines.append(current)
+            current, cur_w = ch, w
+            if len(lines) >= max_lines:
+                lines[-1] = lines[-1] + "…"
+                return "\n".join(lines)
+        else:
+            current += ch; cur_w += w
+    if current: lines.append(current)
+    return "\n".join(lines[:max_lines]) if len(lines) <= max_lines else "\n".join(lines[:max_lines-1]+["…"])
 
 # ============================================================
 # 列名正規化まわり
@@ -131,31 +154,21 @@ def _to_1to5(x):
     if pd.isna(x): return np.nan
     s = unicodedata.normalize("NFKC", str(x)).strip()
     if s == "": return np.nan
-
-    likert = {
-        "非常に低い":1, "とても低い":1, "低い":2, "やや低い":2,
-        "普通":3, "ふつう":3, "やや高い":4, "高い":4, "非常に高い":5, "とても高い":5
-    }
+    likert = {"非常に低い":1,"とても低い":1,"低い":2,"やや低い":2,"普通":3,"ふつう":3,"やや高い":4,"高い":4,"非常に高い":5,"とても高い":5}
     if s in likert: return float(likert[s])
-
     m = re.search(r"([0-9]+)", s)
     if m:
         v = int(m.group(1))
-        if 5 < v <= 100:
-            v = round(v/20)
+        if 5 < v <= 100: v = round(v/20)
         return float(max(1, min(5, v)))
     try:
-        v = float(s)
-        return float(max(1, min(5, v)))
-    except:
-        return np.nan
+        v = float(s); return float(max(1, min(5, v)))
+    except: return np.nan
 
 def coerce_1to5(df: pd.DataFrame) -> pd.DataFrame:
     for c in df.columns:
-        if any(k in str(c) for k in ["コメント","自由記述","備考","メモ"]):
-            continue
-        if c in ("店名","日付","タイムスタンプ"):
-            continue
+        if any(k in str(c) for k in ["コメント","自由記述","備考","メモ"]): continue
+        if c in ("店名","日付","タイムスタンプ"): continue
         df[c] = df[c].apply(_to_1to5)
     return df
 
@@ -163,21 +176,16 @@ def drop_unnamed_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[:, [c for c in df.columns if not str(c).startswith("Unnamed:")]]
 
 def collapse_duplicate_columns(df: pd.DataFrame, agg: str = "mean") -> pd.DataFrame:
-    if not df.columns.has_duplicates:
-        return df
+    if not df.columns.has_duplicates: return df
     new_data = {}
     for name in df.columns.unique():
         block = df.loc[:, df.columns == name]
-        if block.shape[1] == 1:
-            new_data[name] = block.iloc[:, 0]
+        if block.shape[1] == 1: new_data[name] = block.iloc[:, 0]
         else:
             block_num = block.apply(pd.to_numeric, errors="coerce")
-            if agg == "max":
-                new_series = block_num.max(axis=1, skipna=True)
-            elif agg == "min":
-                new_series = block_num.min(axis=1, skipna=True)
-            else:
-                new_series = block_num.mean(axis=1, skipna=True)
+            if agg == "max": new_series = block_num.max(axis=1, skipna=True)
+            elif agg == "min": new_series = block_num.min(axis=1, skipna=True)
+            else: new_series = block_num.mean(axis=1, skipna=True)
             new_data[name] = new_series
     return pd.DataFrame(new_data)
 
@@ -189,10 +197,8 @@ def sanitize_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df.columns.duplicated().any():
         seen, cols = {}, []
         for c in df.columns:
-            if c not in seen:
-                seen[c] = 1; cols.append(c)
-            else:
-                seen[c] += 1; cols.append(f"{c}__dup{seen[c]}")
+            if c not in seen: seen[c] = 1; cols.append(c)
+            else: seen[c] += 1; cols.append(f"{c}__dup{seen[c]}")
         df.columns = cols
     return df
 
@@ -208,8 +214,7 @@ def wide_from_long(df_long: pd.DataFrame) -> pd.DataFrame:
     df_use = df_long[[col_store, col_date, col_item, col_score]].copy()
     df_use[col_score] = df_use[col_score].apply(_to_1to5)
     wide = df_use.pivot_table(index=[col_store, col_date], columns=col_item, values=col_score, aggfunc="mean")
-    wide = wide.reset_index()
-    wide.columns.name = None
+    wide = wide.reset_index(); wide.columns.name = None
     wide = wide.rename(columns={col_store:"店名", col_date:"日付"})
     return coerce_1to5(wide)
 
@@ -221,18 +226,12 @@ def get_service_account_from_secrets() -> dict | None:
         g = st.secrets.get("gcp", None)
         if not g: return None
         pk = g.get("private_key", "")
-        if "\\n" in pk and "\n" not in pk:
-            pk = pk.replace("\\n", "\n")
+        if "\\n" in pk and "\n" not in pk: pk = pk.replace("\\n", "\n")
         req = ["type","project_id","private_key_id","client_email","client_id","token_uri","private_key"]
-        if not all(k in g for k in req):
-            return None
+        if not all(k in g for k in req): return None
         return {
-            "type": g["type"],
-            "project_id": g["project_id"],
-            "private_key_id": g["private_key_id"],
-            "private_key": pk,
-            "client_email": g["client_email"],
-            "client_id": g["client_id"],
+            "type": g["type"], "project_id": g["project_id"], "private_key_id": g["private_key_id"],
+            "private_key": pk, "client_email": g["client_email"], "client_id": g["client_id"],
             "auth_uri": g.get("auth_uri","https://accounts.google.com/o/oauth2/auth"),
             "token_uri": g.get("token_uri","https://oauth2.googleapis.com/token"),
             "auth_provider_x509_cert_url": g.get("auth_provider_x509_cert_url","https://www.googleapis.com/oauth2/v1/certs"),
@@ -243,52 +242,39 @@ def get_service_account_from_secrets() -> dict | None:
         return None
 
 def parse_service_account_text(text: str) -> dict | None:
-    if not text or not text.strip():
-        return None
+    if not text or not text.strip(): return None
     raw = text.strip()
-    # 1) JSON
     try:
         data = json.loads(raw)
     except Exception:
         data = None
-    # 2) TOML/INI風 key="value"
     if data is None and "=" in raw and "{" not in raw:
         kv = {}
         for line in raw.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or line.startswith("["):
-                continue
+            line=line.strip()
+            if not line or line.startswith("#") or line.startswith("["): continue
             if "=" in line:
-                k, v = line.split("=", 1)
-                kv[k.strip()] = v.strip().strip('"').strip("'")
+                k,v=line.split("=",1); kv[k.strip()]=v.strip().strip('"').strip("'")
         need = ["type","project_id","private_key_id","private_key","client_email","client_id","token_uri"]
         if all(k in kv for k in need):
             data = {
-                "type": kv["type"],
-                "project_id": kv["project_id"],
-                "private_key_id": kv["private_key_id"],
-                "private_key": kv["private_key"],
-                "client_email": kv["client_email"],
-                "client_id": kv["client_id"],
+                "type": kv["type"], "project_id": kv["project_id"], "private_key_id": kv["private_key_id"],
+                "private_key": kv["private_key"], "client_email": kv["client_email"], "client_id": kv["client_id"],
                 "auth_uri": kv.get("auth_uri","https://accounts.google.com/o/oauth2/auth"),
                 "token_uri": kv.get("token_uri","https://oauth2.googleapis.com/token"),
                 "auth_provider_x509_cert_url": kv.get("auth_provider_x509_cert_url","https://www.googleapis.com/oauth2/v1/certs"),
                 "client_x509_cert_url": kv.get("client_x509_cert_url",""),
                 "universe_domain": kv.get("universe_domain","googleapis.com"),
             }
-    if data is None:
-        return None
-    # 改行補正
+    if data is None: return None
     pk = data.get("private_key","")
-    if "\\n" in pk and "\n" not in pk:
-        pk = pk.replace("\\n", "\n")
+    if "\\n" in pk and "\n" not in pk: pk = pk.replace("\\n", "\n")
     data["private_key"] = pk
     return data
 
 def get_service_account_any() -> dict | None:
     sc = get_service_account_from_secrets()
-    if sc:
-        return sc
+    if sc: return sc
     pasted = st.session_state.get("svc_json", "")
     return parse_service_account_text(pasted)
 
@@ -301,10 +287,8 @@ def read_from_excel(file) -> pd.DataFrame:
     if find_col(df, "評価項目") and find_col(df, "スコア"):
         df = wide_from_long(df)
     else:
-        alt = find_col(df, "店名")
-        if alt and alt != "店名": df = df.rename(columns={alt:"店名"})
-        alt = find_col(df, "日付")
-        if alt and alt != "日付": df = df.rename(columns={alt:"日付"})
+        alt = find_col(df, "店名");  df = df.rename(columns={alt:"店名"}) if alt and alt!="店名" else df
+        alt = find_col(df, "日付");  df = df.rename(columns={alt:"日付"}) if alt and alt!="日付" else df
         df = coerce_1to5(df)
     df = sanitize_columns(df)
     return df
@@ -315,7 +299,6 @@ def extract_sheet_id(text: str) -> str:
     return m.group(1) if m else t
 
 def read_from_sheets(creds_dict, sheet_id, worksheet) -> pd.DataFrame:
-    # 依存ライブラリは関数内 import（未使用時は不要）
     import gspread
     from google.oauth2.service_account import Credentials
     from gspread_dataframe import get_as_dataframe
@@ -334,10 +317,8 @@ def read_from_sheets(creds_dict, sheet_id, worksheet) -> pd.DataFrame:
     if find_col(df, "評価項目") and find_col(df, "スコア"):
         df = wide_from_long(df)
     else:
-        alt = find_col(df, "店名")
-        if alt and alt != "店名": df = df.rename(columns={alt:"店名"})
-        alt = find_col(df, "日付")
-        if alt and alt != "日付": df = df.rename(columns={alt:"日付"})
+        alt = find_col(df, "店名");  df = df.rename(columns={alt:"店名"}) if alt and alt!="店名" else df
+        alt = find_col(df, "日付");  df = df.rename(columns={alt:"日付"}) if alt and alt!="日付" else df
         df = coerce_1to5(df)
     df = sanitize_columns(df)
     return df
@@ -350,7 +331,6 @@ def pca_svd(df_items: pd.DataFrame):
     for c in X.columns:
         col = pd.to_numeric(X[c], errors="coerce")
         X[c] = col.fillna(col.mean(skipna=True))
-    # 定数列/重複列の除去
     X = X.loc[:, X.var() > 1e-12]
     X = X.loc[:, ~X.T.duplicated()]
     mu = X.mean(axis=0)
@@ -393,22 +373,24 @@ def draw_matrix_plot(df: pd.DataFrame, show_all: bool, show_labels: bool, max_la
     st.dataframe(shown, use_container_width=True)
 
 # ============================================================
-# ベクトル図：角度リペル（文字長対応）＋ 段組み半径ずらし ＋ 外周配置
+# ベクトル図：角度リペル（文字長対応）＋ 段組み半径ずらし ＋ 自動改行
 # ============================================================
 def draw_loading_vectors(loadings: pd.DataFrame,
                          max_vec: int = 15,
                          arrow_scale: float = 1.4,
                          radius_mode: str = "auto",      # "auto" or "fixed"
                          label_scale: float = 1.5,        # auto時：先端×倍率
-                         fixed_radius: float = 1.6,       # fixed時：外周半径（データ座標）
-                         min_angle_deg: float = 10.0,     # 最低角度間隔の下限
-                         char_deg_per_char: float = 0.9,  # 1文字あたり必要な角度（度）
-                         radial_stagger: float = 0.10,    # 段組みの半径ずらし量（データ座標）
+                         fixed_radius: float = 1.8,       # fixed時：外周半径（データ座標）
+                         min_angle_deg: float = 12.0,     # 最低角度間隔の下限
+                         char_deg_per_char: float = 1.8,  # 1文字あたり必要な角度（度）
+                         radial_stagger: float = 0.14,    # 段組みの半径ずらし量
+                         wrap_width_zen: int = 12,        # 全角換算の改行幅
+                         wrap_max_lines: int = 10,        # 改行の最大行数
                          use_guides: bool = True):
     """
     - 角度リペル：前のラベルから “min_angle_deg + char_deg_per_char * 文字数” だけ間隔を空ける
-    - 段組み：奇数番・偶数番でラベル半径を ±radial_stagger だけ交互にずらす（さらに潰れを回避）
-    - ラベル位置は radius_mode で "auto"（先端×倍率） or "fixed"（同一半径）
+    - 段組み：奇数番・偶数番でラベル半径を ±radial_stagger だけ交互にずらす
+    - 自動改行：wrap_width_zen / wrap_max_lines
     """
     if not {"PC1","PC2"}.issubset(loadings.columns):
         fig, ax = plt.subplots(figsize=(9, 7), dpi=120)
@@ -439,51 +421,45 @@ def draw_loading_vectors(loadings: pd.DataFrame,
     # 角度＆基本半径
     raw = []
     for label, x, y in tips:
-        theta = np.arctan2(y, x)                         # -pi..pi
+        theta = np.arctan2(y, x)  # -pi..pi
         r_tip = np.hypot(x, y)
         r_lbl = (fixed_radius if radius_mode=="fixed" else max(r_tip * label_scale, r_tip + 0.05))
         raw.append([label, x, y, theta, r_tip, r_lbl, len(label)])
 
     # 角度でソート
-    raw.sort(key=lambda z: z[3])  # by theta
-    # 角度リペル：文字数に応じた必要間隔を確保
+    raw.sort(key=lambda z: z[3])
+    # 角度リペル（文字長考慮）
     thetas = np.array([d[3] for d in raw], dtype=float)
     need_gap_deg = np.array([min_angle_deg + char_deg_per_char * d[6] for d in raw], dtype=float)
     need_gap = np.deg2rad(need_gap_deg)
-
     adj = thetas.copy()
     for i in range(1, len(adj)):
         gap = adj[i] - adj[i-1]
-        min_need = max(need_gap[i], need_gap[i-1]*0.6)  # 直前ラベルのサイズも少し考慮
+        min_need = max(need_gap[i], need_gap[i-1]*0.6)
         if gap < min_need:
             adj[i] = adj[i-1] + min_need
-
-    # 循環端の処理（先頭↔末尾）
+    # 循環端（先頭↔末尾）
     total_span = adj[-1] - adj[0]
     ring_need = max(need_gap[0], need_gap[-1])
     if total_span < 2*np.pi - ring_need:
         delta = (2*np.pi - ring_need - total_span) / 2.0
-        adj[0] -= delta
-        adj[-1] += delta
-
+        adj[0] -= delta; adj[-1] += delta
     # -pi..pi に戻す
     thetas_adj = ((adj + np.pi) % (2*np.pi)) - np.pi
 
-    # 段組み：交互に半径を前後へオフセット
+    # 段組み（半径ずらし）
     for i, d in enumerate(raw):
-        # iの奇偶で±、さらに近接（角度差が小さい）なら少し強める
         extra = radial_stagger * (1.0 + (need_gap_deg[i] > (min_angle_deg + char_deg_per_char*8)) * 0.25)
-        if i % 2 == 0:
-            raw[i][5] = raw[i][5] + extra
-        else:
-            raw[i][5] = max(raw[i][5] - extra, 0.8)  # 0以下にならないように
+        raw[i][5] = raw[i][5] + (extra if i % 2 == 0 else -extra)
+        raw[i][5] = max(raw[i][5], 0.9)
 
     # ラベル描画（先端→ラベル）
     for theta, d in zip(thetas_adj, raw):
         label, x_tip, y_tip, _, _, r_lbl, _ = d
         x_lbl, y_lbl = r_lbl*np.cos(theta), r_lbl*np.sin(theta)
+        label_wrapped = wrap_japanese_label(label, max_width=wrap_width_zen, max_lines=wrap_max_lines)
         ax.annotate(
-            label,
+            label_wrapped,
             xy=(x_tip, y_tip),
             xytext=(x_lbl, y_lbl),
             arrowprops=dict(arrowstyle="->", lw=0.7, alpha=0.85),
@@ -491,11 +467,10 @@ def draw_loading_vectors(loadings: pd.DataFrame,
         )
 
     if use_guides:
-        circle_r = (fixed_radius if radius_mode=="fixed" else 1.05*arrow_scale)
-        ax.add_artist(plt.Circle((0,0), radius=circle_r, fill=False, linestyle="--", linewidth=0.6, alpha=0.35))
+        guide_r = (fixed_radius if radius_mode=="fixed" else 1.05*arrow_scale)
+        ax.add_artist(plt.Circle((0,0), radius=guide_r, fill=False, linestyle="--", linewidth=0.6, alpha=0.35))
 
     return fig
-
 
 # ============================================================
 # UI
@@ -519,10 +494,10 @@ with st.sidebar:
     st.header("PCA 設定（ベクトル図）")
     max_vec = st.slider("ベクトルの最大表示本数", 0, 30, 15, 1, key="max_vec")
     arrow_scale = st.slider("ベクトル拡大倍率（広がり）", 1.0, 2.5, 1.4, 0.1, key="arrow_scale")
-    label_mode = st.radio("ラベル半径モード", ["自動（先端から外側）", "固定（外周円に揃える）"], index=0, key="label_mode")
-    label_scale = st.slider("自動モード：外側倍率", 1.05, 2.0, 1.50, 0.05, key="label_scale")
-    fixed_radius = st.slider("固定モード：外周半径", 1.1, 2.2, 1.6, 0.1, key="fixed_radius")
-    min_angle_deg = st.slider("最小角度間隔（ラベル同士）", 4, 22, 10, 1, key="min_angle_deg")
+    label_mode = st.radio("ラベル半径モード", ["自動（先端から外側）", "固定（外周円に揃える）"], index=1, key="label_mode")
+    label_scale = st.slider("自動モード：外側倍率", 1.05, 2.2, 1.50, 0.05, key="label_scale")
+    fixed_radius = st.slider("固定モード：外周半径", 1.2, 2.4, 1.8, 0.1, key="fixed_radius")
+    min_angle_deg = st.slider("最小角度間隔（ラベル同士）", 6, 24, 12, 1, key="min_angle_deg")
 
     st.header("参考：合計点マトリクス")
     show_matrix = st.checkbox("旧マトリクスも描く", value=False, key="show_matrix")
@@ -588,7 +563,7 @@ if go:
         else:
             st.info("サンプル数や項目の都合でPC2が得られませんでした。散布図は省略します。")
 
-        # ベクトル図（重なり無し版）
+        # ベクトル図（重なり抑制＋改行）
         fig2 = draw_loading_vectors(
             loadings=loadings,
             max_vec=int(max_vec),
@@ -597,6 +572,9 @@ if go:
             label_scale=float(label_scale),
             fixed_radius=float(fixed_radius),
             min_angle_deg=float(min_angle_deg),
+            # ここは既定値で 全角12字／10行
+            wrap_width_zen=12,
+            wrap_max_lines=10,
             use_guides=True,
         )
         st.pyplot(fig2, clear_figure=True)
