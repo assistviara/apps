@@ -299,6 +299,7 @@ def read_from_sheets(creds_dict, sheet_id, worksheet) -> pd.DataFrame:
     return df
 
 
+
 # ===== PCA（SVDで安定化） =====
 def pca_svd(df_items: pd.DataFrame):
     """
@@ -517,3 +518,41 @@ if go:
 
     except Exception as e:
         st.exception(e)
+
+def sanitize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    列名の空白/コロン/全角半角を整え、Unnamed除去→重複集約→まだ重複があれば強制ユニーク化
+    """
+    # 0) まず Unnamed を落とす
+    df = drop_unnamed_columns(df)
+
+    # 1) 列名トリミング（見た目同じなのに別物…を防ぐ）
+    new_cols = []
+    for c in df.columns:
+        cc = str(c).strip()
+        # ありがちな末尾コロンや全角空白を除去
+        cc = unicodedata.normalize("NFKC", cc).rstrip("：:").strip()
+        new_cols.append(cc)
+    df.columns = new_cols
+
+    # 2) 正規化（完全一致ルール）
+    df = normalize_columns(df)
+
+    # 3) 重複列を平均で集約
+    df = collapse_duplicate_columns(df, agg="mean")
+
+    # 4) それでも重複が残った場合、強制でユニーク化（安全弁）
+    if df.columns.duplicated().any():
+        cols = []
+        seen = {}
+        for c in df.columns:
+            if c not in seen:
+                seen[c] = 1
+                cols.append(c)
+            else:
+                seen[c] += 1
+                cols.append(f"{c}__dup{seen[c]}")
+        df.columns = cols
+
+    return df
+
