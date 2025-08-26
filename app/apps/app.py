@@ -1,5 +1,5 @@
 # app.py — PCA対応版：Excel/Sheets → 前処理 → PCA(SVD) → 可視化
-# たけしゃん用 完全版（secrets の ServiceAccount を自動使用）
+# たけしゃん用 完全版（secrets の ServiceAccount / サイドバー貼り付けを自動使用）
 
 import os, re, json, unicodedata
 from pathlib import Path
@@ -12,7 +12,7 @@ from matplotlib import font_manager, rcParams
 from matplotlib.patches import Rectangle
 
 # ------------------------------------------------------------
-# 最初の Streamlit コールは set_page_config 1 回だけ
+# set_page_config は最初の1回だけ
 # ------------------------------------------------------------
 st.set_page_config(
     page_title="飲食店評価：PCA & マトリクス",
@@ -101,7 +101,6 @@ NORMALIZE_RULES = {
 }
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """完全一致での列名マッピング"""
     mapped = []
     for c in df.columns:
         cn = _norm(c)
@@ -189,7 +188,6 @@ def sanitize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = normalize_columns(df)
     df = collapse_duplicate_columns(df, agg="mean")
     if df.columns.duplicated().any():
-        # 最後の保険：強制ユニーク化
         seen, cols = {}, []
         for c in df.columns:
             if c not in seen:
@@ -226,7 +224,7 @@ def get_service_account_from_secrets() -> dict | None:
         pk = g.get("private_key", "")
         if "\\n" in pk and "\n" not in pk:
             pk = pk.replace("\\n", "\n")
-        req = ["type","project_id","private_key_id","client_email","client_id","token_uri"]
+        req = ["type","project_id","private_key_id","client_email","client_id","token_uri","private_key"]
         if not all(k in g for k in req):
             return None
         return {
@@ -244,6 +242,62 @@ def get_service_account_from_secrets() -> dict | None:
         }
     except Exception:
         return None
+
+# ---- 追加：貼り付け文字列のパース（JSON/TOML風どちらもOK） -----------------
+def parse_service_account_text(text: str) -> dict | None:
+    if not text or not text.strip():
+        return None
+    raw = text.strip()
+
+    # 1) 正規JSON
+    try:
+        data = json.loads(raw)
+    except Exception:
+        data = None
+
+    # 2) key="value" な TOML/INI風
+    if data is None and "=" in raw and "{" not in raw:
+        kv = {}
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("["):
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                kv[k.strip()] = v.strip().strip('"').strip("'")
+        need = ["type","project_id","private_key_id","private_key","client_email","client_id","token_uri"]
+        if all(k in kv for k in need):
+            data = {
+                "type": kv["type"],
+                "project_id": kv["project_id"],
+                "private_key_id": kv["private_key_id"],
+                "private_key": kv["private_key"],
+                "client_email": kv["client_email"],
+                "client_id": kv["client_id"],
+                "auth_uri": kv.get("auth_uri","https://accounts.google.com/o/oauth2/auth"),
+                "token_uri": kv.get("token_uri","https://oauth2.googleapis.com/token"),
+                "auth_provider_x509_cert_url": kv.get("auth_provider_x509_cert_url","https://www.googleapis.com/oauth2/v1/certs"),
+                "client_x509_cert_url": kv.get("client_x509_cert_url",""),
+                "universe_domain": kv.get("universe_domain","googleapis.com"),
+            }
+
+    if data is None:
+        return None
+
+    # 改行補正
+    pk = data.get("private_key","")
+    if "\\n" in pk and "\n" not in pk:
+        pk = pk.replace("\\n", "\n")
+    data["private_key"] = pk
+    return data
+
+# ---- 追加：どこからでも認証情報を取ってくる統一関数 ---------------------------
+def get_service_account_any() -> dict | None:
+    sc = get_service_account_from_secrets()
+    if sc:
+        return sc
+    pasted = st.session_state.get("svc_json", "")
+    return parse_service_account_text(pasted)
 
 # ============================================================
 # 入力データ読込
@@ -361,8 +415,7 @@ with st.sidebar:
         sheet_id_input = ""
         ws_name_input  = ""
     else:
-        # secrets から自動取得
-        creds_dict = get_service_account_from_secrets()
+        creds_dict = get_service_account_from_secrets()  # あれば自動
         sheet_id_input = st.text_input(
             "Spreadsheet ID / URL",
             value=st.secrets.get("gcp", {}).get("sheet_id", ""),
@@ -376,15 +429,9 @@ with st.sidebar:
         if creds_dict:
             st.success("Service Account: secrets から自動読込 ✅")
         else:
-            st.warning("secrets.toml の [gcp] が見つかりません。手動で JSON を貼り付けてください。")
-            with st.expander("手動で Service Account JSON を貼り付ける（secrets が無い場合のみ）", expanded=True):
-                svc_text = st.text_area("Service Account JSON（貼り付け）", height=160, key="svc_json")
-                if svc_text.strip():
-                    try:
-                        creds_dict = json.loads(svc_text)
-                        st.info("貼り付けJSONを使用します。")
-                    except Exception as e:
-                        st.error(f"JSON解析に失敗: {e}")
+            st.warning("secrets.toml の [gcp] が未設定です。下に貼り付ければ使用できます。")
+        # ← secrets があっても無くても常に出す（再実行で確実に拾うため）
+        st.text_area("Service Account JSON（貼り付け）", height=160, key="svc_json")
 
     st.header("PCA 設定")
     show_vectors = st.checkbox("項目ベクトルを重ね描画（最大15）", value=True, key="show_vectors")
@@ -404,9 +451,10 @@ go = st.button("PCAを実行", type="primary", key="run_pca")
 if go:
     try:
         if source == "Googleスプレッドシート":
-            creds_dict = creds_dict or get_service_account_any()
+            # ← secrets / 貼り付け を統一して確実に拾う
+            creds_dict = get_service_account_any()
             if not creds_dict:
-                st.error("認証情報がありません。secrets.toml を設定するか、サイドバーに公式のService Account JSON（または key=\"value\" 形式）を貼り付けてください。")
+                st.error("認証情報がありません。secrets.toml を設定するか、サイドバーへ公式のService Account JSON（または key=\"value\" 形式）を貼り付けてください。")
                 st.stop()
             if not sheet_id_input:
                 st.error("Spreadsheet ID / URL を入力してください。"); st.stop()
@@ -508,4 +556,3 @@ if go:
 
     except Exception as e:
         st.exception(e)
-
