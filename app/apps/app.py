@@ -404,8 +404,10 @@ go = st.button("PCAを実行", type="primary", key="run_pca")
 if go:
     try:
         if source == "Googleスプレッドシート":
+            creds_dict = creds_dict or get_service_account_any()
             if not creds_dict:
-                st.error("認証情報がありません。secrets.toml の [gcp] を設定するか、貼り付けで入力してください。"); st.stop()
+                st.error("認証情報がありません。secrets.toml を設定するか、サイドバーに公式のService Account JSON（または key=\"value\" 形式）を貼り付けてください。")
+                st.stop()
             if not sheet_id_input:
                 st.error("Spreadsheet ID / URL を入力してください。"); st.stop()
             df_raw = read_from_sheets(creds_dict, sheet_id_input, ws_name_input)
