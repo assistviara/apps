@@ -393,22 +393,22 @@ def draw_matrix_plot(df: pd.DataFrame, show_all: bool, show_labels: bool, max_la
     st.dataframe(shown, use_container_width=True)
 
 # ============================================================
-# ベクトル図：極座標リペル（角度最小間隔）＋外周配置
+# ベクトル図：角度リペル（文字長対応）＋ 段組み半径ずらし ＋ 外周配置
 # ============================================================
 def draw_loading_vectors(loadings: pd.DataFrame,
                          max_vec: int = 15,
                          arrow_scale: float = 1.4,
-                         radius_mode: str = "auto",    # "auto" or "fixed"
-                         label_scale: float = 1.5,      # auto時：ベクトル先端×倍率
-                         fixed_radius: float = 1.6,     # fixed時：外周半径（データ座標）
-                         min_angle_deg: float = 10.0,   # ラベル間の最小角度
+                         radius_mode: str = "auto",      # "auto" or "fixed"
+                         label_scale: float = 1.5,        # auto時：先端×倍率
+                         fixed_radius: float = 1.6,       # fixed時：外周半径（データ座標）
+                         min_angle_deg: float = 10.0,     # 最低角度間隔の下限
+                         char_deg_per_char: float = 0.9,  # 1文字あたり必要な角度（度）
+                         radial_stagger: float = 0.10,    # 段組みの半径ずらし量（データ座標）
                          use_guides: bool = True):
     """
-    - ベクトルは原点→(PC1,PC2)*arrow_scale
-    - ラベルは外周に角度順で並べ、隣接ラベルの角度間隔を min_angle_deg 以上に調整
-    - ラベル位置は radius_mode:
-        * "auto": ベクトル先端からさらに label_scale 倍外側
-        * "fixed": すべて fixed_radius の円周上に載せる
+    - 角度リペル：前のラベルから “min_angle_deg + char_deg_per_char * 文字数” だけ間隔を空ける
+    - 段組み：奇数番・偶数番でラベル半径を ±radial_stagger だけ交互にずらす（さらに潰れを回避）
+    - ラベル位置は radius_mode で "auto"（先端×倍率） or "fixed"（同一半径）
     """
     if not {"PC1","PC2"}.issubset(loadings.columns):
         fig, ax = plt.subplots(figsize=(9, 7), dpi=120)
@@ -434,45 +434,56 @@ def draw_loading_vectors(loadings: pd.DataFrame,
     for item, row in L.iterrows():
         x, y = float(row["PC1"])*arrow_scale, float(row["PC2"])*arrow_scale
         ax.arrow(0, 0, x, y, head_width=0.03*arrow_scale, length_includes_head=True, alpha=0.9)
-        tips.append((item, x, y))
+        tips.append((str(item), x, y))
 
-    # 角度（-pi,pi] に正規化
-    data = []
-    for item, x, y in tips:
-        theta = np.arctan2(y, x)  # -pi..pi
+    # 角度＆基本半径
+    raw = []
+    for label, x, y in tips:
+        theta = np.arctan2(y, x)                         # -pi..pi
         r_tip = np.hypot(x, y)
-        if radius_mode == "fixed":
-            r_lbl = fixed_radius
+        r_lbl = (fixed_radius if radius_mode=="fixed" else max(r_tip * label_scale, r_tip + 0.05))
+        raw.append([label, x, y, theta, r_tip, r_lbl, len(label)])
+
+    # 角度でソート
+    raw.sort(key=lambda z: z[3])  # by theta
+    # 角度リペル：文字数に応じた必要間隔を確保
+    thetas = np.array([d[3] for d in raw], dtype=float)
+    need_gap_deg = np.array([min_angle_deg + char_deg_per_char * d[6] for d in raw], dtype=float)
+    need_gap = np.deg2rad(need_gap_deg)
+
+    adj = thetas.copy()
+    for i in range(1, len(adj)):
+        gap = adj[i] - adj[i-1]
+        min_need = max(need_gap[i], need_gap[i-1]*0.6)  # 直前ラベルのサイズも少し考慮
+        if gap < min_need:
+            adj[i] = adj[i-1] + min_need
+
+    # 循環端の処理（先頭↔末尾）
+    total_span = adj[-1] - adj[0]
+    ring_need = max(need_gap[0], need_gap[-1])
+    if total_span < 2*np.pi - ring_need:
+        delta = (2*np.pi - ring_need - total_span) / 2.0
+        adj[0] -= delta
+        adj[-1] += delta
+
+    # -pi..pi に戻す
+    thetas_adj = ((adj + np.pi) % (2*np.pi)) - np.pi
+
+    # 段組み：交互に半径を前後へオフセット
+    for i, d in enumerate(raw):
+        # iの奇偶で±、さらに近接（角度差が小さい）なら少し強める
+        extra = radial_stagger * (1.0 + (need_gap_deg[i] > (min_angle_deg + char_deg_per_char*8)) * 0.25)
+        if i % 2 == 0:
+            raw[i][5] = raw[i][5] + extra
         else:
-            r_lbl = max(r_tip * label_scale, r_tip + 0.05)  # 先端より外側
-        data.append([item, x, y, theta, r_tip, r_lbl])
+            raw[i][5] = max(raw[i][5] - extra, 0.8)  # 0以下にならないように
 
-    # 角度でソート → 最小角度間隔を確保（一周分で調整）
-    data.sort(key=lambda z: z[3])  # theta
-    min_d = np.deg2rad(min_angle_deg)
-
-    thetas = np.array([d[3] for d in data], dtype=float)
-    thetas_wrapped = thetas.copy()
-    for i in range(1, len(thetas_wrapped)):
-        if thetas_wrapped[i] - thetas_wrapped[i-1] < min_d:
-            thetas_wrapped[i] = thetas_wrapped[i-1] + min_d
-    # 端と端（循環）の間隔も調整
-    total_span = thetas_wrapped[-1] - thetas_wrapped[0]
-    if total_span < 2*np.pi - min_d:
-        need = (2*np.pi - min_d) - total_span
-        shift_each = need / 2.0
-        thetas_wrapped[0] -= shift_each
-        thetas_wrapped[-1] += shift_each
-
-    # 角度を -pi..pi に戻す
-    thetas_adj = ((thetas_wrapped + np.pi) % (2*np.pi)) - np.pi
-
-    # ラベル配置と矢印（先端→ラベル）
-    for theta, d in zip(thetas_adj, data):
-        item, x_tip, y_tip, _, _, r_lbl = d
+    # ラベル描画（先端→ラベル）
+    for theta, d in zip(thetas_adj, raw):
+        label, x_tip, y_tip, _, _, r_lbl, _ = d
         x_lbl, y_lbl = r_lbl*np.cos(theta), r_lbl*np.sin(theta)
         ax.annotate(
-            str(item),
+            label,
             xy=(x_tip, y_tip),
             xytext=(x_lbl, y_lbl),
             arrowprops=dict(arrowstyle="->", lw=0.7, alpha=0.85),
@@ -480,11 +491,11 @@ def draw_loading_vectors(loadings: pd.DataFrame,
         )
 
     if use_guides:
-        circle = plt.Circle((0,0), radius=(fixed_radius if radius_mode=="fixed" else 1.05*arrow_scale),
-                            fill=False, linestyle="--", linewidth=0.6, alpha=0.35)
-        ax.add_artist(circle)
+        circle_r = (fixed_radius if radius_mode=="fixed" else 1.05*arrow_scale)
+        ax.add_artist(plt.Circle((0,0), radius=circle_r, fill=False, linestyle="--", linewidth=0.6, alpha=0.35))
 
     return fig
+
 
 # ============================================================
 # UI
