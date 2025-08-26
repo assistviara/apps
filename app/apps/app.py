@@ -1,7 +1,8 @@
 # app.py — PCA対応版：Excel/Sheets → 前処理 → PCA(SVD) → 可視化
-# たけしゃん用 完全版（secrets の ServiceAccount / サイドバー貼り付けを自動使用）
+# たけしゃん用 完全版（ServiceAccount：secrets優先／サイドバー貼付けも可）
+# ベクトル図：ラベルを外側に出し、矢印で結び、簡易リペルで重なりを緩和
 
-import os, re, json, unicodedata
+import os, re, json, unicodedata, math
 from pathlib import Path
 
 import numpy as np
@@ -21,10 +22,10 @@ st.set_page_config(
 )
 
 # ============================================================
-# フォント（任意）
+# フォント（日本語表示の安定化）
 # ============================================================
 FONT_DIR = Path(__file__).parent / "fonts"
-JP_FONT = FONT_DIR / "NotoSansJP-Regular.ttf"
+JP_FONT = FONT_DIR / "NotoSansJP-Regular.ttf"  # 任意で同梱可
 try:
     if JP_FONT.exists():
         font_manager.fontManager.addfont(str(JP_FONT))
@@ -34,6 +35,7 @@ try:
         rcParams["font.family"] = "sans-serif"
         rcParams["font.sans-serif"] = [jp_name, "DejaVu Sans", "Arial", "Liberation Sans"]
     else:
+        # ローカルの日本語フォントがある場合は適宜追記可
         rcParams["font.family"] = "DejaVu Sans"
     rcParams["axes.unicode_minus"] = False
 except Exception:
@@ -153,9 +155,9 @@ def _to_1to5(x):
 
 def coerce_1to5(df: pd.DataFrame) -> pd.DataFrame:
     for c in df.columns:
-        if any(k in str(c) for k in ["コメント","自由記述","備考","メモ"]): 
+        if any(k in str(c) for k in ["コメント","自由記述","備考","メモ"]):
             continue
-        if c in ("店名","日付","タイムスタンプ"): 
+        if c in ("店名","日付","タイムスタンプ"):
             continue
         df[c] = df[c].apply(_to_1to5)
     return df
@@ -243,19 +245,17 @@ def get_service_account_from_secrets() -> dict | None:
     except Exception:
         return None
 
-# ---- 追加：貼り付け文字列のパース（JSON/TOML風どちらもOK） -----------------
+# ---- 追加：貼り付け文字列のパース（JSON/TOML風どちらもOK）
 def parse_service_account_text(text: str) -> dict | None:
     if not text or not text.strip():
         return None
     raw = text.strip()
-
-    # 1) 正規JSON
+    # 1) JSON
     try:
         data = json.loads(raw)
     except Exception:
         data = None
-
-    # 2) key="value" な TOML/INI風
+    # 2) key="value" 形式
     if data is None and "=" in raw and "{" not in raw:
         kv = {}
         for line in raw.splitlines():
@@ -280,10 +280,8 @@ def parse_service_account_text(text: str) -> dict | None:
                 "client_x509_cert_url": kv.get("client_x509_cert_url",""),
                 "universe_domain": kv.get("universe_domain","googleapis.com"),
             }
-
     if data is None:
         return None
-
     # 改行補正
     pk = data.get("private_key","")
     if "\\n" in pk and "\n" not in pk:
@@ -291,7 +289,6 @@ def parse_service_account_text(text: str) -> dict | None:
     data["private_key"] = pk
     return data
 
-# ---- 追加：どこからでも認証情報を取ってくる統一関数 ---------------------------
 def get_service_account_any() -> dict | None:
     sc = get_service_account_from_secrets()
     if sc:
@@ -398,6 +395,76 @@ def draw_matrix_plot(df: pd.DataFrame, show_all: bool, show_labels: bool, max_la
     st.dataframe(shown, use_container_width=True)
 
 # ============================================================
+# ベクトル図：外側ラベリング＋簡易リペル
+# ============================================================
+def draw_loading_vectors(loadings: pd.DataFrame, max_vec: int, label_scale: float, arrow_scale: float,
+                         repel_iter: int = 80, repel_eps: float = 0.035, use_arrows=True):
+    """
+    label_scale: ラベル配置半径（ベクトル先端の何倍の距離に配置するか）
+    arrow_scale: 矢印長の倍率（見やすさ用にベクトル自体を拡大）
+    repel_iter: 反発計算の反復回数
+    repel_eps : ラベル同士の最小距離（埋め込み座標系での距離）
+    """
+    fig, ax = plt.subplots(figsize=(9, 7), dpi=120)
+    ax.axhline(0, lw=1, color="gray", alpha=0.6)
+    ax.axvline(0, lw=1, color="gray", alpha=0.6)
+    ax.set_xlim(-1.2*arrow_scale, 1.2*arrow_scale)
+    ax.set_ylim(-1.2*arrow_scale, 1.2*arrow_scale)
+    ax.set_xlabel("PC1 loading")
+    ax.set_ylabel("PC2 loading")
+    ax.set_title("項目ベクトル（負荷量）")
+
+    L = loadings[["PC1","PC2"]].copy()
+    L["_mag"] = np.sqrt(L["PC1"]**2 + L["PC2"]**2)
+    L = L.sort_values("_mag", ascending=False).head(max(1, int(max_vec)))
+
+    # 矢印（拡大表示）
+    for item, row in L.iterrows():
+        x, y = float(row["PC1"])*arrow_scale, float(row["PC2"])*arrow_scale
+        ax.arrow(0, 0, x, y, head_width=0.03*arrow_scale, length_includes_head=True, alpha=0.9)
+
+    # 初期ラベル位置：ベクトル方向へ label_scale 倍
+    labels = L.index.to_list()
+    tips   = L[["PC1","PC2"]].values * arrow_scale
+    pos    = tips * label_scale
+
+    # 簡易リペル：互いに押し合って重なりを避ける
+    for _ in range(repel_iter):
+        moved = False
+        for i in range(len(pos)):
+            for j in range(i+1, len(pos)):
+                dx, dy = pos[i] - pos[j]
+                dist2 = dx*dx + dy*dy
+                if dist2 == 0:
+                    dx = (np.random.rand()-0.5)*1e-3
+                    dy = (np.random.rand()-0.5)*1e-3
+                    dist2 = dx*dx + dy*dy
+                if dist2 < repel_eps**2:
+                    force = (repel_eps/np.sqrt(dist2) - 1.0) * 0.015
+                    ux, uy = dx/np.sqrt(dist2), dy/np.sqrt(dist2)
+                    pos[i] += np.array([ux, uy]) * force
+                    pos[j] -= np.array([ux, uy]) * force
+                    moved = True
+        if not moved:
+            break
+
+    # ラベル描画（矢印線で先端と接続）
+    for (x_tip, y_tip), (x_lab, y_lab), label in zip(tips, pos, labels):
+        if use_arrows:
+            ax.annotate(
+                str(label),
+                xy=(x_tip, y_tip),
+                xytext=(x_lab, y_lab),
+                arrowprops=dict(arrowstyle="->", lw=0.6, alpha=0.8),
+                fontsize=9,
+                ha="center", va="center"
+            )
+        else:
+            ax.text(x_lab, y_lab, str(label), fontsize=9)
+
+    return fig
+
+# ============================================================
 # UI
 # ============================================================
 st.title("飲食店評価：主成分分析（PCA） & マトリクス")
@@ -430,12 +497,13 @@ with st.sidebar:
             st.success("Service Account: secrets から自動読込 ✅")
         else:
             st.warning("secrets.toml の [gcp] が未設定です。下に貼り付ければ使用できます。")
-        # ← secrets があっても無くても常に出す（再実行で確実に拾うため）
         st.text_area("Service Account JSON（貼り付け）", height=160, key="svc_json")
 
     st.header("PCA 設定")
-    show_vectors = st.checkbox("項目ベクトルを重ね描画（最大15）", value=True, key="show_vectors")
+    show_vectors = st.checkbox("項目ベクトルを重ね描画（最大30）", value=True, key="show_vectors")
     max_vec = st.slider("ベクトルの最大表示本数", 0, 30, 15, 1, key="max_vec")
+    arrow_scale = st.slider("ベクトル拡大倍率（図の広がり）", 1.0, 2.5, 1.4, 0.1, key="arrow_scale")
+    label_scale = st.slider("ラベル外側倍率（先端からの距離）", 1.05, 2.0, 1.45, 0.05, key="label_scale")
 
     st.header("参考：合計点マトリクス")
     show_matrix = st.checkbox("旧マトリクスも描く", value=False, key="show_matrix")
@@ -451,7 +519,6 @@ go = st.button("PCAを実行", type="primary", key="run_pca")
 if go:
     try:
         if source == "Googleスプレッドシート":
-            # ← secrets / 貼り付け を統一して確実に拾う
             creds_dict = get_service_account_any()
             if not creds_dict:
                 st.error("認証情報がありません。secrets.toml を設定するか、サイドバーへ公式のService Account JSON（または key=\"value\" 形式）を貼り付けてください。")
@@ -498,20 +565,17 @@ if go:
         ax.set_title("PCA マップ（店舗の位置：PC1×PC2）")
         st.pyplot(fig, clear_figure=True)
 
-        # ── ベクトル（負荷量）
-        if {"PC1","PC2"}.issubset(loadings.columns):
-            fig2, ax2 = plt.subplots(figsize=(9, 7), dpi=120)
-            ax2.axhline(0, lw=1, color="gray", alpha=0.6)
-            ax2.axvline(0, lw=1, color="gray", alpha=0.6)
-            ax2.set_xlim(-1.1, 1.1); ax2.set_ylim(-1.1, 1.1)
-            ax2.set_xlabel("PC1 loading"); ax2.set_ylabel("PC2 loading")
-            ax2.set_title("項目ベクトル（負荷量）")
-            L = loadings[["PC1","PC2"]].copy()
-            L["_mag"] = np.sqrt(L["PC1"]**2 + L["PC2"]**2)
-            L = L.sort_values("_mag", ascending=False).head(max(1, int(st.session_state.get("max_vec", 15))))
-            for item, row in L.iterrows():
-                ax2.arrow(0,0, row["PC1"], row["PC2"], head_width=0.03, length_includes_head=True, alpha=0.85)
-                ax2.text(row["PC1"]*1.05, row["PC2"]*1.05, str(item), fontsize=9)
+        # ── ベクトル（負荷量）：外側ラベリング＋簡易リペル
+        if {"PC1","PC2"}.issubset(loadings.columns) and st.session_state.get("show_vectors", True):
+            fig2 = draw_loading_vectors(
+                loadings=loadings,
+                max_vec=int(st.session_state.get("max_vec", 15)),
+                label_scale=float(st.session_state.get("label_scale", 1.45)),
+                arrow_scale=float(st.session_state.get("arrow_scale", 1.4)),
+                repel_iter=100,
+                repel_eps=0.04,
+                use_arrows=True
+            )
             st.pyplot(fig2, clear_figure=True)
 
         # ── テーブル
@@ -556,3 +620,4 @@ if go:
 
     except Exception as e:
         st.exception(e)
+
