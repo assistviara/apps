@@ -107,12 +107,13 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         cn = _norm(c)
         mapped = None
         for key, dest in NORMALIZE_RULES.items():
-            if _norm(key) == cn:   # ★ 完全一致に変更
+            if _norm(key) == cn:   # ★ ここを完全一致に
                 mapped = dest
                 break
         new_cols.append(mapped or c)
     df.columns = new_cols
     return df
+
 
 
 def find_col(df: pd.DataFrame, logical_name: str) -> str | None:
@@ -176,15 +177,10 @@ def coerce_1to5(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def drop_unnamed_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Excel/Sheets特有の 'Unnamed: xx' 列を落とす"""
     keep = [c for c in df.columns if not str(c).startswith("Unnamed:")]
     return df.loc[:, keep]
 
 def collapse_duplicate_columns(df: pd.DataFrame, agg: str = "mean") -> pd.DataFrame:
-    """
-    同名列が複数ある場合に 1 列へ集約する。
-    agg: 'mean' | 'max' | 'min' など（NaNは自動無視）
-    """
     if df.columns.has_duplicates:
         new_data = {}
         for name in df.columns.unique():
@@ -226,16 +222,34 @@ def wide_from_long(df_long: pd.DataFrame) -> pd.DataFrame:
 
 # ===== データ読み込み =====
 def read_from_excel(file) -> pd.DataFrame:
+    # 1) 読み込み & ゴミ列（Unnamed）を先に落とす
     df = pd.read_excel(file).dropna(how="all")
-    # 縦持ち？
+    df = drop_unnamed_columns(df)
+
+    # 2) 縦持ち？（Section/評価項目/スコア… があるなら縦）
     if find_col(df, "評価項目") and find_col(df, "スコア"):
-        return wide_from_long(df)
-    # 横持ち
-    alt = find_col(df, "店名")
-    if alt and alt != "店名": df = df.rename(columns={alt:"店名"})
-    alt = find_col(df, "日付")
-    if alt and alt != "日付": df = df.rename(columns={alt:"日付"})
-    return coerce_1to5(df)
+        # 縦→横へ（内部で _to_1to5 → coerce_1to5 済み）
+        df = wide_from_long(df)
+    else:
+        # 3) 横持ち（各項目が列）
+        #    列名ゆらぎを正規化（完全一致ルール）→ 店名・日付の別名も拾う
+        df = normalize_columns(df)
+        alt = find_col(df, "店名")
+        if alt and alt != "店名":
+            df = df.rename(columns={alt: "店名"})
+        alt = find_col(df, "日付")
+        if alt and alt != "日付":
+            df = df.rename(columns={alt: "日付"})
+        # スコアを 1–5 に強制変換（自由記述はスキップ）
+        df = coerce_1to5(df)
+
+    # 4) 後処理：再度 Unnamed の混入を除去し、重複列名を集約
+    df = drop_unnamed_columns(df)
+    df = collapse_duplicate_columns(df, agg="mean")
+
+    # 5) 返す
+    return df
+
 
 def extract_sheet_id(text: str) -> str:
     t = (text or "").strip()
@@ -247,6 +261,7 @@ def read_from_sheets(creds_dict, sheet_id, worksheet) -> pd.DataFrame:
     from google.oauth2.service_account import Credentials
     from gspread_dataframe import get_as_dataframe
 
+    # 1) 接続
     creds = Credentials.from_service_account_info(
         creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
     )
@@ -257,16 +272,32 @@ def read_from_sheets(creds_dict, sheet_id, worksheet) -> pd.DataFrame:
         ws = sh.worksheet(worksheet)
     except Exception:
         ws = sh.worksheets()[0]
+
+    # 2) 読み込み & ゴミ列除去
     df = get_as_dataframe(ws, evaluate_formulas=True, header=0).dropna(how="all")
-    # 縦持ちの可能性もあるので両対応
+    df = drop_unnamed_columns(df)
+
+    # 3) 縦持ち？（Section/評価項目/スコア… があるなら縦）
     if find_col(df, "評価項目") and find_col(df, "スコア"):
-        return wide_from_long(df)
-    df = normalize_columns(df)
-    alt = find_col(df, "店名")
-    if alt and alt != "店名": df = df.rename(columns={alt:"店名"})
-    alt = find_col(df, "日付")
-    if alt and alt != "日付": df = df.rename(columns={alt:"日付"})
-    return coerce_1to5(df)
+        df = wide_from_long(df)  # 内部で _to_1to5 → coerce_1to5 済み
+    else:
+        # 4) 横持ち：列名を完全一致で正規化→ 店名/日付の別名吸収 → スコア強制変換
+        df = normalize_columns(df)
+        alt = find_col(df, "店名")
+        if alt and alt != "店名":
+            df = df.rename(columns={alt: "店名"})
+        alt = find_col(df, "日付")
+        if alt and alt != "日付":
+            df = df.rename(columns={alt: "日付"})
+        df = coerce_1to5(df)
+
+    # 5) 後処理：再度 Unnamed 除去 & 重複列名の集約（平均）
+    df = drop_unnamed_columns(df)
+    df = collapse_duplicate_columns(df, agg="mean")
+
+    # 6) 返却
+    return df
+
 
 # ===== PCA（SVDで安定化） =====
 def pca_svd(df_items: pd.DataFrame):
