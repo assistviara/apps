@@ -1,7 +1,6 @@
 # app.py — PCA対応版：Excel/Sheets → 前処理 → PCA(SVD) → 可視化
-# ラベル重なり解消：角度リペル（文字長＋行数）＋ 段組み半径ずらし ＋ 自動改行 ＋
-#                     近似バウンディング（角度幅×半径帯）で当たり判定→半径押し出し
-
+# 衝突しないラベル配置：自動改行＋角度リペル（文字幅＋行数考慮）＋
+#                         角度×半径の当たり判定→半径押し出し（多行重なり防止）
 import os, re, json, unicodedata
 from pathlib import Path
 import numpy as np
@@ -19,6 +18,18 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ============================================================
+# secrets 安全読み取りヘルパー（secrets.toml が無くても落ちない）
+# ============================================================
+def safe_secret(section: str, key: str, default: str = "") -> str:
+    try:
+        val = st.secrets.get(section, None)  # 無いときはここで例外になるので try で保護
+    except Exception:
+        return default
+    if isinstance(val, dict):
+        return str(val.get(key, default))
+    return default
 
 # ============================================================
 # 旧マトリクス用列（多様性/ブランド防衛スコアの集計用）
@@ -249,6 +260,7 @@ def parse_service_account_text(text: str) -> dict | None:
         data = json.loads(raw)
     except Exception:
         data = None
+    # INIライクにも対応
     if data is None and "=" in raw and "{" not in raw:
         kv = {}
         for line in raw.splitlines():
@@ -382,7 +394,7 @@ def draw_loading_vectors(loadings: pd.DataFrame,
                          radius_mode: str = "auto",      # "auto" or "fixed"
                          label_scale: float = 1.5,        # auto時：先端×倍率
                          fixed_radius: float = 1.8,       # fixed時：外周半径（データ座標）
-                         min_angle_deg: float = 12.0,     # 最低角度間隔の下限（横幅の下限）
+                         min_angle_deg: float = 12.0,     # 最低角度間隔（横の下限）
                          char_deg_per_char: float = 1.8,  # 1文字あたり必要な角度（度）
                          radial_stagger: float = 0.14,    # 基本の段組みずらし量
                          wrap_width_zen: int = 12,        # 自動改行の幅（全角換算）
@@ -390,9 +402,9 @@ def draw_loading_vectors(loadings: pd.DataFrame,
                          use_guides: bool = True):
     """
     改善点：
-      1) 自動改行後の「行数」を考慮して必要角度を増やす（行が増えるほど角度幅が必要）
+      1) 自動改行後の「行数」も考慮して必要角度を増やす（行が増えるほど角度幅が必要）
       2) 各ラベルを「角度幅×半径帯」の矩形として近似し、既配置ラベルと衝突チェック
-         衝突すれば半径方向に押し出して、重なりを解消（当たり判定は極座標上）
+         衝突すれば半径方向に押し出して重なり解消（多行の縦重なりを除去）
     """
     if not {"PC1","PC2"}.issubset(loadings.columns):
         fig, ax = plt.subplots(figsize=(9, 7), dpi=120)
@@ -413,7 +425,7 @@ def draw_loading_vectors(loadings: pd.DataFrame,
     L["_mag"] = np.sqrt(L["PC1"]**2 + L["PC2"]**2)
     L = L.sort_values("_mag", ascending=False).head(max(1, int(max_vec)))
 
-    # ベクトル（拡大）
+    # ベクトル描画（拡大）
     tips = []
     for item, row in L.iterrows():
         x, y = float(row["PC1"])*arrow_scale, float(row["PC2"])*arrow_scale
@@ -444,7 +456,6 @@ def draw_loading_vectors(loadings: pd.DataFrame,
     raw.sort(key=lambda d: d["theta"])
 
     # ---- 角度リペル（横方向）：文字数＋行数で必要角度を増やす
-    # 行数が増えると箱の高さが上がり、上下の行のずれで見かけの幅も広がるため、係数を少し足す
     base_deg = np.array([min_angle_deg + char_deg_per_char * d["char_count"] + 0.6*(d["line_count"]-1)
                          for d in raw], dtype=float)
     need_gap = np.deg2rad(base_deg)
@@ -456,18 +467,18 @@ def draw_loading_vectors(loadings: pd.DataFrame,
         if gap < min_need:
             adj[i] = adj[i-1] + min_need
 
-    # 端面（−π..π）をまたぐ場合の調整
-    total_span = adj[-1] - adj[0] if len(adj) >= 2 else 0.0
-    ring_need = max(need_gap[0], need_gap[-1]) if len(adj) >= 2 else 0.0
-    if len(adj) >= 2 and total_span < 2*np.pi - ring_need:
-        delta = (2*np.pi - ring_need - total_span) / 2.0
-        adj[0] -= delta; adj[-1] += delta
+    # 端面（−π..π）またぎの調整
+    if len(adj) >= 2:
+        total_span = adj[-1] - adj[0]
+        ring_need = max(need_gap[0], need_gap[-1])
+        if total_span < 2*np.pi - ring_need:
+            delta = (2*np.pi - ring_need - total_span) / 2.0
+            adj[0] -= delta; adj[-1] += delta
     thetas_adj = ((adj + np.pi) % (2*np.pi)) - np.pi  # 戻す
 
     # ---- 段組み＋当たり判定で半径方向の押し出し（縦方向）
-    # ラベルの縦サイズを「行数×行高」で近似。行高はデータ座標（半径）で ~0.10 を基準に。
-    line_height = 0.10
-    placed = []  # 既配置の「角度中心・角度半幅・半径中心・半径半幅」のタプル群
+    line_height = 0.10  # データ座標での行高近似
+    placed = []  # 既配置ラベルの近似バウンディング
 
     for i, d in enumerate(raw):
         theta = float(thetas_adj[i])
@@ -475,23 +486,20 @@ def draw_loading_vectors(loadings: pd.DataFrame,
         r_lbl = d["r_lbl"] + (radial_stagger if i % 2 == 0 else -radial_stagger)
         r_lbl = max(r_lbl, 0.9)
 
-        # 角度方向の半幅（文字数由来の角度幅を半分に）
+        # 角度方向の半幅（必要角度幅の半分）
         ang_half = 0.5 * need_gap[i]
-
-        # 半径方向の半幅（行数由来の高さを半分に）
+        # 半径方向の半幅（行数に比例）
         rad_half = 0.5 * (line_height * d["line_count"])
 
-        # 既配置と衝突する間は半径を少しずつ押し出す
         def overlap(a, b):
-            # 角度は円なので、差の最小値を使う
-            a1, a2 = a["theta"]-a["ang_half"], a["theta"]+a["ang_half"]
-            b1, b2 = b["theta"]-b["ang_half"], b["theta"]+b["ang_half"]
-            # 角度区間を 0..2π に正規化して重なりチェック
+            # 角度は円なので 0..2π に正規化した区間で重なり判断
             def norm_int(lo, hi):
                 lo = (lo + np.pi) % (2*np.pi)
                 hi = (hi + np.pi) % (2*np.pi)
                 if lo <= hi: return [(lo, hi)]
                 else: return [(0, hi), (lo, 2*np.pi)]
+            a1, a2 = a["theta"]-a["ang_half"], a["theta"]+a["ang_half"]
+            b1, b2 = b["theta"]-b["ang_half"], b["theta"]+b["ang_half"]
             A = norm_int(a1, a2)
             B = norm_int(b1, b2)
             angle_overlaps = any(not (x2 < y1 or y2 < x1) for (x1,x2) in A for (y1,y2) in B)
@@ -500,15 +508,12 @@ def draw_loading_vectors(loadings: pd.DataFrame,
             return not (a["r"]+a["rad_half"] < b["r"]-b["rad_half"] or
                         b["r"]+b["rad_half"] < a["r"]-a["rad_half"])
 
-        # 押し出しループ（最大反復は安全のため上限）
-        max_push = 200
-        push_step = 0.06  # 少しずつ外へ
+        # 押し出しループ
         box = {"theta": theta, "ang_half": ang_half, "r": r_lbl, "rad_half": rad_half}
-        tries = 0
+        push_step, tries, max_push = 0.06, 0, 200
         while any(overlap(box, q) for q in placed) and tries < max_push:
             box["r"] += push_step
             tries += 1
-
         placed.append(box)
 
         # 実描画
@@ -542,8 +547,13 @@ with st.sidebar:
         st.caption("縦持ち（Section/評価項目/スコア…）でも横持ち（各項目が列）でもOK。")
         sheet_id_input = ""; ws_name_input  = ""
     else:
-        sheet_id_input = st.text_input("Spreadsheet ID / URL", value=st.secrets.get("gcp", {}).get("sheet_id", ""), key="sheet_id")
-        ws_name_input  = st.text_input("Worksheet名（タブ名）", value=st.secrets.get("gcp", {}).get("worksheet", "Form Responses"), key="worksheet_name")
+        # ← ここは safe_secret() 経由にして FileNotFoundError を防止
+        sheet_id_input = st.text_input("Spreadsheet ID / URL",
+                                       value=safe_secret("gcp", "sheet_id", ""),
+                                       key="sheet_id")
+        ws_name_input  = st.text_input("Worksheet名（タブ名）",
+                                       value=safe_secret("gcp", "worksheet", "Form Responses"),
+                                       key="worksheet_name")
         st.text_area("Service Account JSON（貼り付け）", height=160, key="svc_json")
 
     st.header("PCA 設定（ベクトル図）")
@@ -611,8 +621,8 @@ if go:
                     ax.annotate(name, (xy[i,0], xy[i,1]), xytext=(4,4), textcoords="offset points", fontsize=9)
             ax.axhline(0, lw=1, color="gray", alpha=0.6)
             ax.axvline(0, lw=1, color="gray", alpha=0.6)
-            ax.set_xlabel(f"PC1 ({ev_ratio[0]*100:.1f}% var)")
-            ax.set_ylabel(f"PC2 ({ev_ratio[1]*100:.1f}% var)")
+            ax.set_xlabel(f"PC1=QSC ({ev_ratio[0]*100:.1f}% var)")
+            ax.set_ylabel(f"PC2=文化資本 ({ev_ratio[1]*100:.1f}% var)")
             ax.set_title("PCA マップ（店舗の位置：PC1×PC2）")
             st.pyplot(fig, clear_figure=True)
         else:
@@ -670,3 +680,6 @@ if go:
 
     except Exception as e:
         st.exception(e)
+# app.py — PCA対応版：Excel/Sheets → 前処理 → PCA(SVD) → 可視化
+# 軸固定：横=文化・縦=QSC、ラベル横書きで表示
+
