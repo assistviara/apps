@@ -621,8 +621,8 @@ if go:
                     ax.annotate(name, (xy[i,0], xy[i,1]), xytext=(4,4), textcoords="offset points", fontsize=9)
             ax.axhline(0, lw=1, color="gray", alpha=0.6)
             ax.axvline(0, lw=1, color="gray", alpha=0.6)
-            ax.set_xlabel(f"PC1=QSC ({ev_ratio[0]*100:.1f}% var)")
-            ax.set_ylabel(f"PC2=文化資本 ({ev_ratio[1]*100:.1f}% var)")
+            ax.set_xlabel(f"PC1=総合力 ({ev_ratio[0]*100:.1f}% var)")
+            ax.set_ylabel(f"PC2=文化資本 vs QSC（個性 ↔ 安定性） ({ev_ratio[1]*100:.1f}% var)")
             ax.set_title("PCA マップ（店舗の位置：PC1×PC2）")
             st.pyplot(fig, clear_figure=True)
         else:
